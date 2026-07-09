@@ -1,0 +1,14 @@
+.git
+.idea
+.env
+.env.*
+config.yaml
+config.local.yaml
+logs
+*.log
+*.db
+star_meet.db
+star-meet
+star-meet-backend
+star-meet-server
+vendor

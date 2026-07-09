@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+!.env.production.example
+config.yaml
+config.local.yaml
+logs/
+*.log
+*.db
+star_meet.db
+star-meet
+star-meet-backend
+star-meet-server
+star-meet-server-new
+.idea/
+vendor/
