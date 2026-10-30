@@ -102,3 +102,87 @@ func TestPublicConfigDoesNotExposeAPIKey(t *testing.T) {
 		t.Fatalf("unexpected chat provider/model: %+v", resp)
 	}
 }
+
+func TestChatQuotaDefaultsSeedWithoutOverwritingEdits(t *testing.T) {
+	db := setupRuntimeConfigTestDB(t)
+	svc := &RuntimeConfigService{DB: db}
+
+	if err := svc.SeedDefaults(ChatQuotaRuntimeDefaults()); err != nil {
+		t.Fatalf("seed chat quota defaults: %v", err)
+	}
+
+	settings := svc.ChatQuotaSettings()
+	if !settings.Enabled || settings.FreeDailyMessages != DefaultChatQuotaFreeDailyMessages || !settings.MemberUnlimited {
+		t.Fatalf("unexpected seeded quota settings: %+v", settings)
+	}
+	if settings.ResetTimezone != DefaultChatQuotaResetTimezone {
+		t.Fatalf("unexpected reset timezone: %q", settings.ResetTimezone)
+	}
+
+	if _, err := svc.Upsert(RuntimeConfigChatQuotaFreeDailyMessages, "8", false, "custom daily cap"); err != nil {
+		t.Fatalf("upsert custom daily cap: %v", err)
+	}
+	if err := svc.SeedDefaults(ChatQuotaRuntimeDefaults()); err != nil {
+		t.Fatalf("reseed chat quota defaults: %v", err)
+	}
+
+	settings = svc.ChatQuotaSettings()
+	if settings.FreeDailyMessages != 8 {
+		t.Fatalf("expected admin edit to be preserved, got %d", settings.FreeDailyMessages)
+	}
+}
+
+func TestChatContextBudgetDefaultsAndOverrides(t *testing.T) {
+	db := setupRuntimeConfigTestDB(t)
+	svc := &RuntimeConfigService{DB: db}
+	if err := svc.SeedDefaults(ChatContextRuntimeDefaults()); err != nil {
+		t.Fatalf("seed chat context defaults: %v", err)
+	}
+
+	defaults := svc.ChatContextBudget()
+	if defaults.ModelContextTokens != 8192 || defaults.HistoryTokens != 2200 ||
+		defaults.SummaryTokens != 600 || defaults.MemoryTokens != 500 ||
+		defaults.DirectorHistoryTokens != 350 || defaults.DirectorOutputTokens != 350 || defaults.OutputTokens != 800 ||
+		defaults.SafetyMarginTokens != 400 || defaults.FixedPromptTokens != 1200 || defaults.DirectorRefreshInterval != 2 {
+		t.Fatalf("unexpected chat context defaults: %+v", defaults)
+	}
+
+	if _, err := svc.Upsert(RuntimeConfigChatContextHistoryTokens, "2600", false, "custom history"); err != nil {
+		t.Fatalf("override history budget: %v", err)
+	}
+	if got := svc.ChatContextBudget().HistoryTokens; got != 2600 {
+		t.Fatalf("expected overridden history budget 2600, got %d", got)
+	}
+}
+
+func TestChatContextBudgetCapsHistoryAgainstModelWindow(t *testing.T) {
+	budget := DefaultChatContextBudget()
+	if got := budget.EffectiveHistoryTokens(); got != 2200 {
+		t.Fatalf("expected 8K budget to retain 2200 history tokens, got %d", got)
+	}
+	budget.ModelContextTokens = 4096
+	if got := budget.EffectiveHistoryTokens(); got != 596 {
+		t.Fatalf("expected 4K budget to cap history at 596, got %d", got)
+	}
+}
+
+func TestGetBoolOrDefaultParsesCommonValues(t *testing.T) {
+	db := setupRuntimeConfigTestDB(t)
+	svc := &RuntimeConfigService{DB: db}
+
+	if _, err := svc.Upsert(RuntimeConfigChatQuotaEnabled, "false", false, ""); err != nil {
+		t.Fatalf("upsert enabled=false: %v", err)
+	}
+	if svc.GetBoolOrDefault(RuntimeConfigChatQuotaEnabled, true) {
+		t.Fatal("expected enabled=false")
+	}
+	if _, err := svc.Upsert(RuntimeConfigChatQuotaMemberUnlimited, "YES", false, ""); err != nil {
+		t.Fatalf("upsert unlimited=yes: %v", err)
+	}
+	if !svc.GetBoolOrDefault(RuntimeConfigChatQuotaMemberUnlimited, false) {
+		t.Fatal("expected member_unlimited=true")
+	}
+	if svc.GetBoolOrDefault("chat.quota.missing", true) != true {
+		t.Fatal("expected missing key to use default true")
+	}
+}

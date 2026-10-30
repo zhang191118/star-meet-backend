@@ -74,6 +74,18 @@ services:
       EMAIL_PASSWORD: ${EMAIL_PASSWORD:-}
       EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-星遇 StarMeet}
       EMAIL_FROM_EMAIL: ${EMAIL_FROM_EMAIL:-noreply@starmeet.app}
+      # Resend 邮件服务（配置后优先于 SMTP 发送验证码邮件）
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM: ${RESEND_FROM:-StarMeet <noreply@kwbb.com>}
+      # Sign in with Apple：identity token 的受众校验用 bundle id
+      APPLE_BUNDLE_ID: ${APPLE_BUNDLE_ID:-com.guoliang.starmeet}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_TOPIC: ${APNS_TOPIC:-com.guoliang.starmeet}
+      APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:-production}
+      APNS_PRIVATE_KEY_PATH: /run/secrets/apns/AuthKey.p8
+    volumes:
+      - ${APNS_PRIVATE_KEY_FILE:-./secrets/AuthKey_XXXXXXXXXX.p8}:/run/secrets/apns/AuthKey.p8:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health >/dev/null || exit 1"]
       interval: 15s

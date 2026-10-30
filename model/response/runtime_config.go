@@ -20,4 +20,6 @@ type PublicRuntimeConfigResp struct {
 	ChatProvider     string                `json:"chat_provider"`
 	ChatPrimaryModel string                `json:"chat_primary_model,omitempty"`
 	OpenAICompat     RuntimeAIProviderResp `json:"openai_compat"`
+	// 背景音乐配置
+	MusicEnabled bool `json:"music_enabled"`
 }

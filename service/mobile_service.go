@@ -7,12 +7,14 @@ import (
 
 	"star-meet-backend/model/database"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
 
 	"gorm.io/gorm"
 )
 
 type MobileService struct {
-	DB *gorm.DB
+	DB            *gorm.DB
+	RuntimeConfig *RuntimeConfigService
 }
 
 var (
@@ -65,8 +67,9 @@ type MobileMembership struct {
 }
 
 type MobileDailyLimits struct {
-	RemainingMessages int `json:"remaining_messages"`
-	RemainingDraws    int `json:"remaining_draws"`
+	RemainingMessages  int `json:"remaining_messages"`
+	RemainingDraws     int `json:"remaining_draws"`
+	FreeTrialRemaining int `json:"free_trial_remaining"`
 }
 
 type MobileSection struct {
@@ -101,7 +104,7 @@ func NewMobileService(db *gorm.DB) *MobileService {
 	return &MobileService{DB: db}
 }
 
-func (s *MobileService) GetHome(userID string) (*MobileHomeResp, error) {
+func (s *MobileService) GetHome(userID, lang string) (*MobileHomeResp, error) {
 	user, err := s.loadUser(userID)
 	if err != nil {
 		return nil, err
@@ -112,12 +115,12 @@ func (s *MobileService) GetHome(userID string) (*MobileHomeResp, error) {
 		return nil, err
 	}
 
-	sessions, err := s.loadRecentSessions(userID, 10)
+	sessions, err := s.loadRecentSessions(userID, 10, lang)
 	if err != nil {
 		return nil, err
 	}
 
-	recommendations, err := s.loadRecommendedCharacters(8)
+	recommendations, err := s.loadRecommendedCharacters(userID, 8, lang)
 	if err != nil {
 		return nil, err
 	}
@@ -134,9 +137,9 @@ func (s *MobileService) GetHome(userID string) (*MobileHomeResp, error) {
 		Wallet:         wallet,
 		RecentSessions: sessions,
 		RecommendSections: []MobileSection{
-			{ID: "for_you", Title: "为你推荐", Items: recommendations},
+			{ID: "for_you", Title: i18n.TranslateMobileString("mobile_for_you_title", lang), Items: recommendations},
 		},
-		Banners:             defaultMobileBanners(),
+		Banners:             defaultMobileBanners(lang),
 		ServerTime:          time.Now().Unix(),
 		Degraded:            degraded,
 		UnavailableSections: unavailableSections,
@@ -164,14 +167,14 @@ func (s *MobileService) GetDashboard(userID string) (*MeDashboardResp, error) {
 		Settings:            toUserSettingsResp(settings),
 		Subscription:        toMembership(*user),
 		Wallet:              wallet,
-		DailyLimits:         defaultDailyLimits(*user),
+		DailyLimits:         s.dailyLimits(*user),
 		ServerTime:          time.Now().Unix(),
 		Degraded:            degraded,
 		UnavailableSections: unavailableSections,
 	}, nil
 }
 
-func (s *MobileService) GetBatch(userID string, req MobileBatchReq) (*MobileBatchResp, error) {
+func (s *MobileService) GetBatch(userID string, req MobileBatchReq, lang string) (*MobileBatchResp, error) {
 	includes := normalizeMobileIncludes(req.Include)
 	result := &MobileBatchResp{
 		ServerTime: time.Now().Unix(),
@@ -183,7 +186,7 @@ func (s *MobileService) GetBatch(userID string, req MobileBatchReq) (*MobileBatc
 	}
 
 	if includes["characters"] {
-		characters, err := s.loadCharactersByIDs(req.CharacterIDs, 50)
+		characters, err := s.loadCharactersByIDs(userID, req.CharacterIDs, 50, lang)
 		if err != nil {
 			return nil, err
 		}
@@ -270,18 +273,19 @@ func defaultWallet() map[string]int64 {
 	}
 }
 
-func (s *MobileService) loadRecentSessions(userID string, limit int) ([]response.SessionResp, error) {
+func (s *MobileService) loadRecentSessions(userID string, limit int, lang string) ([]response.SessionResp, error) {
 	chatService := &ChatService{DB: s.DB}
-	sessions, _, err := chatService.GetSessions(userID, 1, limit)
+	sessions, _, err := chatService.GetSessions(userID, 1, limit, lang)
 	if err != nil {
 		return nil, err
 	}
 	return sessions, nil
 }
 
-func (s *MobileService) loadRecommendedCharacters(limit int) ([]MobileCharacterCard, error) {
+func (s *MobileService) loadRecommendedCharacters(userID string, limit int, lang string) ([]MobileCharacterCard, error) {
 	var characters []database.Character
-	if err := s.DB.Where("is_public = ?", 1).
+	query := excludeBlockedCharacters(s.DB, applyPublicMarketplaceFilter(s.DB.Model(&database.Character{})), userID)
+	if err := query.
 		Order("chat_count DESC, created_at DESC, id DESC").
 		Limit(limit).
 		Find(&characters).Error; err != nil {
@@ -290,19 +294,24 @@ func (s *MobileService) loadRecommendedCharacters(limit int) ([]MobileCharacterC
 
 	items := make([]MobileCharacterCard, 0, len(characters))
 	for _, character := range characters {
-		items = append(items, toMobileCharacterCard(character))
+		items = append(items, toMobileCharacterCard(character, lang))
 	}
 	return items, nil
 }
 
-func (s *MobileService) loadCharactersByIDs(characterIDs []string, limit int) ([]MobileCharacterCard, error) {
+func (s *MobileService) loadCharactersByIDs(userID string, characterIDs []string, limit int, lang string) ([]MobileCharacterCard, error) {
 	ids := dedupeMobileIDs(characterIDs, limit)
 	if len(ids) == 0 {
 		return []MobileCharacterCard{}, nil
 	}
 
 	var characters []database.Character
-	if err := s.DB.Where("character_id IN ? AND is_public = ?", ids, 1).Find(&characters).Error; err != nil {
+	query := excludeBlockedCharacters(
+		s.DB,
+		applyPublicMarketplaceFilter(s.DB.Model(&database.Character{}).Where("character_id IN ?", ids)),
+		userID,
+	)
+	if err := query.Find(&characters).Error; err != nil {
 		return nil, err
 	}
 
@@ -314,7 +323,7 @@ func (s *MobileService) loadCharactersByIDs(characterIDs []string, limit int) ([
 	items := make([]MobileCharacterCard, 0, len(characters))
 	for _, id := range ids {
 		if character, ok := characterByID[id]; ok {
-			items = append(items, toMobileCharacterCard(character))
+			items = append(items, toMobileCharacterCard(character, lang))
 		}
 	}
 	return items, nil
@@ -363,26 +372,26 @@ func dedupeMobileIDs(ids []string, limit int) []string {
 	return result
 }
 
-func toMobileCharacterCard(character database.Character) MobileCharacterCard {
+func toMobileCharacterCard(character database.Character, lang string) MobileCharacterCard {
 	personality := parseMobilePersonality(character.Personality)
 	subtitle := character.Occupation
 	if subtitle == "" {
 		subtitle = character.Relationship
 	}
 
-	reason := "近期很受欢迎"
+	reason := i18n.TranslateMobileString("mobile_reason_hot", lang)
 	if character.ChatCount == 0 {
-		reason = "适合开启第一次聊天"
+		reason = i18n.TranslateMobileString("mobile_reason_new", lang)
 	}
 
 	return MobileCharacterCard{
 		CharacterID:   character.CharacterID,
-		Name:          character.Name,
+		Name:          i18n.TranslateCharacterName(character.Name, lang),
 		Gender:        character.Gender,
 		Age:           character.Age,
 		Personality:   personality,
 		Occupation:    character.Occupation,
-		Relationship:  character.Relationship,
+		Relationship:  i18n.TranslateCategoryName(character.Relationship, lang),
 		Avatar:        character.Avatar,
 		Subtitle:      subtitle,
 		Reason:        reason,
@@ -421,19 +430,53 @@ func toMembership(user database.User) MobileMembership {
 	return membership
 }
 
-func defaultDailyLimits(user database.User) MobileDailyLimits {
-	if isPaidMemberLevel(user.MemberLevel) {
-		return MobileDailyLimits{RemainingMessages: 9999, RemainingDraws: 20}
+const unlimitedRemainingMessages = 9999
+
+func (s *MobileService) dailyLimits(user database.User) MobileDailyLimits {
+	quota := DefaultChatQuotaSettings()
+	if s != nil && s.RuntimeConfig != nil {
+		quota = s.RuntimeConfig.ChatQuotaSettings()
 	}
-	return MobileDailyLimits{RemainingMessages: 50, RemainingDraws: 3}
+
+	now := time.Now()
+	var db *gorm.DB
+	if s != nil {
+		db = s.DB
+	}
+	status, err := evaluateChatQuota(db, quota, user, now)
+	if err != nil {
+		status = ChatQuotaStatus{
+			Enabled:           quota.Enabled,
+			MembershipActive:  userHasActiveMembershipAt(user, now),
+			Limit:             quota.FreeDailyMessages,
+			RemainingMessages: quota.FreeDailyMessages,
+		}
+		if !quota.Enabled || (status.MembershipActive && quota.MemberUnlimited) {
+			status.Unlimited = true
+			status.RemainingMessages = unlimitedRemainingMessages
+		}
+	}
+
+	if status.Unlimited {
+		return MobileDailyLimits{
+			RemainingMessages:  status.RemainingMessages,
+			RemainingDraws:     quota.MemberDailyDraws,
+			FreeTrialRemaining: -1,
+		}
+	}
+	return MobileDailyLimits{
+		RemainingMessages:  status.RemainingMessages,
+		RemainingDraws:     quota.FreeDailyDraws,
+		FreeTrialRemaining: quota.FreeTrialMessages,
+	}
 }
 
-func defaultMobileBanners() []MobileBanner {
+func defaultMobileBanners(lang string) []MobileBanner {
 	return []MobileBanner{
 		{
 			ID:       "daily_checkin",
-			Title:    "今日陪伴已开启",
-			Subtitle: "和喜欢的角色聊几句，亲密度会慢慢升温。",
+			Title:    i18n.TranslateMobileString("mobile_banner_daily_title", lang),
+			Subtitle: i18n.TranslateMobileString("mobile_banner_daily_subtitle", lang),
 			Action:   "open_discovery",
 		},
 	}

@@ -3,11 +3,13 @@ package v1
 import (
 	"errors"
 	"net/http"
+	"os"
 	"star-meet-backend/global"
 	"star-meet-backend/model/database"
 	"star-meet-backend/model/response"
 	"star-meet-backend/service"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -135,8 +137,12 @@ func (a *CurrencyAPI) Recharge(c *gin.Context) {
 		return
 	}
 
-	// 模拟支付成功，实际应该集成支付网关
-	// 这里直接添加货币
+	if os.Getenv("GIN_MODE") == "release" {
+		response.FailWithError(c, http.StatusPaymentRequired, "Apple payment required", "payment_required", nil)
+		return
+	}
+
+	// This legacy endpoint remains available only for local development and grants.
 	packages, err := a.CurrencyService.GetPackages()
 	if err != nil {
 		response.Fail(c, http.StatusInternalServerError, err.Error())
@@ -181,6 +187,63 @@ func (a *CurrencyAPI) Recharge(c *gin.Context) {
 
 	responseData["balance"] = balance
 	response.OkWithData(c, responseData)
+}
+
+func (a *CurrencyAPI) VerifyAppleReceipt(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		failUnauthenticated(c)
+		return
+	}
+
+	var req struct {
+		Receipt       string `json:"receipt"`
+		PackageID     string `json:"package_id" binding:"required"`
+		TransactionID string `json:"transaction_id"`
+		JWS           string `json:"jws"`
+		IsSandbox     bool   `json:"is_sandbox"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failBindError(c, err, req)
+		return
+	}
+	if strings.TrimSpace(req.Receipt) == "" && strings.TrimSpace(req.TransactionID) == "" {
+		response.FailWithError(c, http.StatusUnprocessableEntity, "validation failed", "validation_failed", gin.H{
+			"field":  "transaction_id",
+			"reason": "receipt_or_transaction_required",
+		})
+		return
+	}
+
+	balance, idempotent, err := a.CurrencyService.ConfirmAppleCurrencyPurchase(userID, service.AppleCurrencyPurchaseConfirmation{
+		Receipt:       req.Receipt,
+		PackageID:     req.PackageID,
+		TransactionID: req.TransactionID,
+		JWS:           req.JWS,
+		IsSandbox:     req.IsSandbox,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidAppleCurrencyReceipt) {
+			response.FailWithError(c, http.StatusUnprocessableEntity, "invalid receipt", "invalid_receipt", nil)
+			return
+		}
+		if errors.Is(err, service.ErrAppleCurrencyReceiptAlreadyUsed) {
+			response.FailWithError(c, http.StatusConflict, "receipt already used", "receipt_already_used", nil)
+			return
+		}
+		if errors.Is(err, service.ErrAppleReceiptRevoked) {
+			response.FailWithError(c, http.StatusConflict, "Apple transaction has been revoked", "apple_transaction_revoked", nil)
+			return
+		}
+		if errors.Is(err, service.ErrCurrencyIdempotencyConflict) {
+			response.FailWithError(c, http.StatusConflict, "transaction conflicts with an existing recharge", "currency_idempotency_conflict", nil)
+			return
+		}
+		response.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	response.OkWithData(c, gin.H{"balance": balance, "idempotent": idempotent})
 }
 
 func toRechargePackageRespList(packages []database.RechargePackage) []rechargePackageResp {

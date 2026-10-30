@@ -2,6 +2,7 @@ package embedding
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +15,8 @@ const (
 )
 
 type Client struct {
-	APIKey  string
-	Client  *http.Client
+	APIKey string
+	Client *http.Client
 }
 
 type EmbeddingRequest struct {
@@ -49,6 +50,10 @@ func NewClient(apiKey string) *Client {
 
 // GetEmbedding 获取文本的embedding向量
 func (c *Client) GetEmbedding(text string) ([]float64, error) {
+	return c.GetEmbeddingContext(context.Background(), text)
+}
+
+func (c *Client) GetEmbeddingContext(ctx context.Context, text string) ([]float64, error) {
 	if c.APIKey == "" {
 		return nil, fmt.Errorf("zhipu api key not configured")
 	}
@@ -60,7 +65,7 @@ func (c *Client) GetEmbedding(text string) ([]float64, error) {
 
 	jsonBody, _ := json.Marshal(reqBody)
 
-	req, _ := http.NewRequest("POST", APIURL, bytes.NewBuffer(jsonBody))
+	req, _ := http.NewRequestWithContext(ctx, "POST", APIURL, bytes.NewBuffer(jsonBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
@@ -76,7 +81,7 @@ func (c *Client) GetEmbedding(text string) ([]float64, error) {
 	json.Unmarshal(respBody, &embResp)
 
 	if len(embResp.Data) == 0 {
-		return nil, fmt.Errorf("embedding failed: %s", string(respBody))
+		return nil, fmt.Errorf("embedding failed: status=%d", resp.StatusCode)
 	}
 
 	return embResp.Data[0].Embedding, nil

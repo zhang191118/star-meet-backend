@@ -12,8 +12,14 @@ type CharacterResp struct {
 	Background       string   `json:"background"`
 	VoiceID          string   `json:"voice_id"`
 	Relationship     string   `json:"relationship"`
+	Constellation    string   `json:"constellation,omitempty"` // 星座（zod_* 键，客户端按语言转显示名）
 	InteractionStyle string   `json:"interaction_style"`
 	Avatar           string   `json:"avatar"`
+	BgImage          string   `json:"bg_image,omitempty"`
+	BannerImage      string   `json:"banner_image,omitempty"`
+	Comment          string   `json:"comment,omitempty"`
+	Narrative        string   `json:"narrative,omitempty"`
+	BasicSetting     string   `json:"basic_setting,omitempty"`
 	SystemPrompt     string   `json:"system_prompt,omitempty"`
 	IsPublic         int      `json:"is_public"` // 0=私有, 1=系统公共, 2=用户私有
 	Affection        int      `json:"affection"`
@@ -21,20 +27,41 @@ type CharacterResp struct {
 	FavoriteCount    int      `json:"favorite_count"` // 收藏次数
 	Mem0AgentID      string   `json:"mem0_agent_id,omitempty"`
 	CreatedAt        int64    `json:"created_at"`
+	Example          string   `json:"example,omitempty"`
+	FirstSituation   string   `json:"first_situation,omitempty"`
+	FirstWords       string   `json:"first_words,omitempty"`
+	CharacterType    int      `json:"character_type"`
+	TagsJSON         string   `json:"tags_json,omitempty"`
+	PersonalityTags  string   `json:"personality_tags,omitempty"`
 }
 
 // 公开角色响应（广场）
 type PublicCharacterResp struct {
-	CharacterID   string   `json:"character_id"`
-	Name          string   `json:"name"`
-	Gender        string   `json:"gender"`
-	Personality   []string `json:"personality"`
-	Relationship  string   `json:"relationship"`
-	Avatar        string   `json:"avatar"`
-	ChatCount     int      `json:"chat_count"`     // 被聊天次数
-	FavoriteCount int      `json:"favorite_count"` // 收藏次数
-	IsFavorited   bool     `json:"is_favorited"`   // 当前用户是否收藏
-	CreatedAt     int64    `json:"created_at"`
+	CharacterID     string   `json:"character_id"`
+	Name            string   `json:"name"`
+	Gender          string   `json:"gender"`
+	Age             int      `json:"age,omitempty"`
+	Personality     []string `json:"personality"`
+	Occupation      string   `json:"occupation,omitempty"`
+	Relationship    string   `json:"relationship"`
+	Constellation   string   `json:"constellation,omitempty"` // 星座（zod_* 键）
+	Avatar          string   `json:"avatar"`
+	BannerImage     string   `json:"banner_image,omitempty"`
+	BgImage         string   `json:"bg_image,omitempty"`
+	Comment         string   `json:"comment,omitempty"`
+	Narrative       string   `json:"narrative,omitempty"`
+	BasicSetting    string   `json:"basic_setting,omitempty"`
+	Example         string   `json:"example,omitempty"`
+	FirstSituation  string   `json:"first_situation,omitempty"`
+	FirstWords      string   `json:"first_words,omitempty"`
+	CharacterType   int      `json:"character_type,omitempty"`
+	TagsJSON        string   `json:"tags_json,omitempty"`
+	PersonalityTags string   `json:"personality_tags,omitempty"`
+	ChatCount       int      `json:"chat_count"`     // 被聊天次数
+	FavoriteCount   int      `json:"favorite_count"` // 收藏次数
+	IsFavorited     bool     `json:"is_favorited"`   // 当前用户是否收藏
+	IsEncountered   bool     `json:"is_encountered"` // 当前用户是否已邂逅
+	CreatedAt       int64    `json:"created_at"`
 }
 
 // 用户响应
@@ -60,7 +87,8 @@ type UserResp struct {
 
 // 登录响应
 type LoginResp struct {
-	UserID string `json:"user_id"`
-	Token  string `json:"token"`
-	IsNew  bool   `json:"is_new"`
+	UserID       string `json:"user_id"`
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	IsNew        bool   `json:"is_new"`
 }

@@ -10,8 +10,8 @@ type CreateCharacterReq struct {
 	Occupation       string   `json:"occupation"`
 	Background       string   `json:"background"`
 	VoiceID          string   `json:"voice_id"`
-	Relationship     string   `json:"relationship"`      // 恋人/朋友/知己/自定义
-	InteractionStyle string   `json:"interaction_style"` // 撒娇型/成熟型/互怼型/治愈型
+	Relationship     string   `json:"relationship"`      // 伙伴/朋友/知己/自定义
+	InteractionStyle string   `json:"interaction_style"` // 温暖型/成熟型/互怼型/治愈型
 	Avatar           string   `json:"avatar"`            // base64或URL
 	IsPublic         int      `json:"is_public"`         // 0=私有, 1=系统公共, 2=用户私有
 	ChatCount        int      `json:"chat_count"`        // 初始聊天数
@@ -42,6 +42,7 @@ type GetCharacterListReq struct {
 
 // 获取公开角色请求
 type GetPublicCharactersReq struct {
+	UserID   string `form:"-"` // 从 JWT 中获取，不直接由前端传入
 	Category string `form:"category"` // 男友/女友/朋友/全部
 	Page     int    `form:"page"`
 	PageSize int    `form:"page_size"`
@@ -52,6 +53,7 @@ type GetPublicCharactersReq struct {
 
 // 搜索角色请求
 type SearchCharacterReq struct {
+	UserID      string `form:"-"` // 从 JWT 中获取，不直接由前端传入
 	Keyword     string `form:"keyword"`
 	Category    string `form:"category"`
 	Gender      string `form:"gender"`

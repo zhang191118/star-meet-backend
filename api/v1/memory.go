@@ -45,6 +45,9 @@ func (a *MemoryAPI) GetList(c *gin.Context) {
 
 	result, total, err := a.MemoryService.GetMemoryList(req)
 	if err != nil {
+		if failMemoryCharacterAccess(c, err) {
+			return
+		}
 		response.FailWithMessage(c, err.Error())
 		return
 	}
@@ -81,6 +84,9 @@ func (a *MemoryAPI) GetStats(c *gin.Context) {
 
 	result, err := a.MemoryService.GetMemoryStats(userID.(string), characterID)
 	if err != nil {
+		if failMemoryCharacterAccess(c, err) {
+			return
+		}
 		response.FailWithMessage(c, err.Error())
 		return
 	}
@@ -109,9 +115,13 @@ func (a *MemoryAPI) Add(c *gin.Context) {
 		return
 	}
 	req.UserID = userID.(string)
+	req.Source = "manual"
 
 	result, err := a.MemoryService.AddMemory(req)
 	if err != nil {
+		if failMemoryCharacterAccess(c, err) {
+			return
+		}
 		response.FailWithMessage(c, err.Error())
 		return
 	}
@@ -218,9 +228,23 @@ func (a *MemoryAPI) Search(c *gin.Context) {
 
 	result, err := a.MemoryService.SearchMemory(req)
 	if err != nil {
+		if failMemoryCharacterAccess(c, err) {
+			return
+		}
 		response.FailWithMessage(c, err.Error())
 		return
 	}
 
 	response.OkWithData(c, result)
+}
+
+func failMemoryCharacterAccess(c *gin.Context, err error) bool {
+	if !errors.Is(err, service.ErrCharacterUnavailable) {
+		return false
+	}
+	response.FailWithError(c, http.StatusNotFound, "character unavailable", "character_unavailable", gin.H{
+		"field":  "character_id",
+		"reason": "not_found_or_not_owned",
+	})
+	return true
 }

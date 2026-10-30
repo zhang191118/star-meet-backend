@@ -1,5 +1,10 @@
 package emotion
 
+import (
+	"star-meet-backend/pkg/i18n"
+	"strings"
+)
+
 // 情绪类型
 const (
 	EmotionHappy    = "happy"    // 开心
@@ -117,7 +122,20 @@ func Detect(text string) string {
 		return EmotionNeutral
 	}
 
-	text = toLower(text)
+	text = i18n.NormalizeDetectionText(text)
+	// Strip explicit negations before counting overlapping keyword fragments.
+	for _, phrase := range []string{"不是不开心", "没有不开心", "not unhappy"} {
+		text = strings.ReplaceAll(text, phrase, "")
+	}
+	for _, phrase := range []string{"不开心", "不快乐", "不高兴", "not happy", "unhappy"} {
+		if strings.Contains(text, phrase) {
+			return EmotionSad
+		}
+	}
+	for _, phrase := range []string{"不喜欢", "不爱", "没有想你", "不想你", "不孤独", "不寂寞", "不无聊", "不生气", "不愤怒", "不害怕", "不担心", "not lonely", "not angry", "not scared", "don't like", "do not like", "don't love"} {
+		text = strings.ReplaceAll(text, phrase, "")
+	}
+
 	emotionScores := map[string]int{
 		EmotionHappy:    0,
 		EmotionSad:      0,
@@ -142,7 +160,8 @@ func Detect(text string) string {
 	maxScore := 0
 	maxEmotion := EmotionNeutral
 
-	for emotion, score := range emotionScores {
+	for _, emotion := range []string{EmotionSad, EmotionFear, EmotionAngry, EmotionLonely, EmotionConfused, EmotionBored, EmotionLove, EmotionHappy, EmotionExcited} {
+		score := emotionScores[emotion]
 		if score > maxScore {
 			maxScore = score
 			maxEmotion = emotion

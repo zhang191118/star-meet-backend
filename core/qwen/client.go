@@ -2,6 +2,7 @@ package qwen
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +15,8 @@ const (
 )
 
 type Client struct {
-	APIKey  string
-	Client  *http.Client
+	APIKey string
+	Client *http.Client
 }
 
 type Message struct {
@@ -24,8 +25,8 @@ type Message struct {
 }
 
 type GenerateRequest struct {
-	Model      string    `json:"model"`
-	Input      Input     `json:"input"`
+	Model      string     `json:"model"`
+	Input      Input      `json:"input"`
 	Parameters Parameters `json:"parameters"`
 }
 
@@ -70,6 +71,10 @@ func NewClient(apiKey string) *Client {
 
 // 直接调用Qwen（不使用RAG Flow时）
 func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (string, error) {
+	return c.GenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) GenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (string, error) {
 	if c.APIKey == "" {
 		return "", fmt.Errorf("qwen api key not configured")
 	}
@@ -103,7 +108,10 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 
 	jsonBody, _ := json.Marshal(reqBody)
 
-	req, _ := http.NewRequest("POST", APIURL, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", APIURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
@@ -119,7 +127,7 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 	json.Unmarshal(respBody, &genResp)
 
 	if genResp.Code != "" && genResp.Code != "success" {
-		return "", fmt.Errorf("qwen api error: %s - %s", genResp.Code, genResp.Message)
+		return "", fmt.Errorf("qwen provider returned an error")
 	}
 
 	return genResp.Output.Text, nil

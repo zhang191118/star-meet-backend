@@ -1,15 +1,18 @@
 package v1
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"star-meet-backend/global"
 	"star-meet-backend/model/request"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
 	"star-meet-backend/service"
 
 	"github.com/gin-gonic/gin"
@@ -51,32 +54,74 @@ func (a *ChatAPI) StreamMessage(c *gin.Context) {
 
 	req.UserID = userID.(string)
 
-	streamCh, errCh := a.ChatService.StreamMessage(req.UserID, req.CharacterID, req.Message, req.MessageType, req.UserMessageID, req.ReplyMessageID)
+	resolvedCharacterID, err := a.ChatService.ResolveChatCharacterAndCheckQuota(req.UserID, req.CharacterID, req.UserMessageID, req.ReplyMessageID)
+	if err != nil {
+		if failChatQuotaExceeded(c, err) {
+			return
+		}
+		if failChatCharacterAccess(c, err) {
+			return
+		}
+		response.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	req.CharacterID = resolvedCharacterID
+
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	streamCh, errCh := a.ChatService.StreamMessageContext(ctx, req.UserID, req.CharacterID, req.Message, req.MessageType, req.UserMessageID, req.ReplyMessageID, req.QuotedMessageID)
+	c.Header("Cache-Control", "no-cache")
+	c.Header("X-Accel-Buffering", "no")
 
 	c.Stream(func(w io.Writer) bool {
-		select {
-		case event, ok := <-streamCh:
-			if !ok {
-				c.SSEvent("done", "[DONE]")
+		for streamCh != nil || errCh != nil {
+			select {
+			case <-ctx.Done():
 				return false
+			case event, ok := <-streamCh:
+				if !ok {
+					streamCh = nil
+					continue
+				}
+				if event.Type == "meta" {
+					// 发送元数据（消息ID、情绪等）
+					// 注意：这里我们使用 JSON 格式发送 meta 事件
+					c.SSEvent("meta", event.Meta)
+				} else if event.Type == "director" {
+					// 导演批注（当前形势分析），独立事件，不混入气泡内容
+					c.SSEvent("director", sseText(event.Content))
+				} else {
+					// Gin emits data: without a delimiter. Add the optional SSE space
+					// so standards-compliant clients preserve actual leading spaces.
+					c.SSEvent("message", sseText(event.Content))
+				}
+				return true
+			case err, ok := <-errCh:
+				if ok && err != nil {
+					message := "AI 回复中断，请重试"
+					if errors.Is(err, service.ErrAIServiceUnavailable) {
+						message = service.ErrAIServiceUnavailable.Error()
+					}
+					if errors.Is(err, service.ErrChatCharacterUnavailable) {
+						message = "角色暂时不可用"
+					}
+					if errors.Is(err, service.ErrChatCharacterBlocked) {
+						message = "该角色已被封锁"
+					}
+					c.SSEvent("error", message)
+					return false
+				}
+				errCh = nil
 			}
-			if event.Type == "meta" {
-				// 发送元数据（消息ID、情绪等）
-				// 注意：这里我们使用 JSON 格式发送 meta 事件
-				c.SSEvent("meta", event.Meta)
-			} else {
-				// 发送内容
-				c.SSEvent("message", event.Content)
-			}
-			return true
-		case err := <-errCh:
-			if err != nil {
-				c.SSEvent("error", err.Error())
-				return false
-			}
-			return true
 		}
+		c.SSEvent("done", "[DONE]")
+		return false
 	})
+}
+
+// Each data line needs its own optional delimiter before meaningful spaces.
+func sseText(content string) string {
+	return " " + strings.ReplaceAll(content, "\n", "\n ")
 }
 
 // SendMessage 发送消息
@@ -119,12 +164,17 @@ func (a *ChatAPI) SendMessage(c *gin.Context) {
 		req.MessageType = "text"
 	}
 
-	result, err := a.ChatService.SendMessageWithIDs(req.UserID, req.CharacterID, req.Message, req.MessageType, req.UserMessageID, req.ReplyMessageID)
+	result, err := a.ChatService.SendMessageWithIDsContext(c.Request.Context(), req.UserID, req.CharacterID, req.Message, req.MessageType, req.UserMessageID, req.ReplyMessageID)
 	if err != nil {
-		if errors.Is(err, service.ErrChatCharacterUnavailable) {
-			response.FailWithError(c, http.StatusNotFound, "character unavailable", "character_unavailable", gin.H{
-				"field":  "character_id",
-				"reason": "not_found",
+		if failChatQuotaExceeded(c, err) {
+			return
+		}
+		if failChatCharacterAccess(c, err) {
+			return
+		}
+		if errors.Is(err, service.ErrAIServiceUnavailable) {
+			response.FailWithError(c, http.StatusServiceUnavailable, err.Error(), "ai_service_unavailable", gin.H{
+				"retry_after": 3,
 			})
 			return
 		}
@@ -176,6 +226,10 @@ func (a *ChatAPI) GetHistory(c *gin.Context) {
 		result, total, err = a.ChatService.GetHistory(userIDStr, characterID, page, pageSize)
 	}
 	if err != nil {
+		if errors.Is(err, service.ErrChatCharacterBlocked) {
+			failChatCharacterBlocked(c)
+			return
+		}
 		response.FailWithMessage(c, err.Error())
 		return
 	}
@@ -189,6 +243,41 @@ func (a *ChatAPI) GetHistory(c *gin.Context) {
 		"before_id":      beforeID,
 		"next_before_id": nextBeforeID(result),
 	})
+}
+
+func failChatCharacterBlocked(c *gin.Context) {
+	response.FailWithError(c, http.StatusForbidden, "character blocked", "character_blocked", gin.H{
+		"field":  "character_id",
+		"reason": "blocked",
+	})
+}
+
+func failChatCharacterAccess(c *gin.Context, err error) bool {
+	if errors.Is(err, service.ErrChatCharacterBlocked) {
+		failChatCharacterBlocked(c)
+		return true
+	}
+	if errors.Is(err, service.ErrChatCharacterUnavailable) {
+		response.FailWithError(c, http.StatusNotFound, "character unavailable", "character_unavailable", gin.H{
+			"field":  "character_id",
+			"reason": "not_found",
+		})
+		return true
+	}
+	return false
+}
+
+func failChatQuotaExceeded(c *gin.Context, err error) bool {
+	var quotaErr *service.ChatQuotaExceededError
+	if !errors.As(err, &quotaErr) {
+		return false
+	}
+	response.FailWithError(c, http.StatusForbidden, "chat quota exceeded", "chat_quota_exceeded", gin.H{
+		"remaining_messages":  quotaErr.RemainingMessages,
+		"reset_at":            quotaErr.ResetAt,
+		"membership_required": true,
+	})
+	return true
 }
 
 // GetSessions 获取会话列表
@@ -211,7 +300,8 @@ func (a *ChatAPI) GetSessions(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	page, pageSize = normalizePagination(page, pageSize, 20)
 
-	result, total, err := a.ChatService.GetSessions(userIDStr, page, pageSize)
+	lang := i18n.NormalizeLang(resolveLang(c))
+	result, total, err := a.ChatService.GetSessions(userIDStr, page, pageSize, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -414,7 +504,8 @@ func (a *ChatAPI) MarkMessageRead(c *gin.Context) {
 	userIDStr := userID.(string)
 
 	var req struct {
-		MessageID   string `json:"message_id" binding:"required"`
+		// message_id 可选：仅传 character_id 时只清零会话未读（左滑"标为已读"）
+		MessageID   string `json:"message_id"`
 		CharacterID string `json:"character_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -423,7 +514,7 @@ func (a *ChatAPI) MarkMessageRead(c *gin.Context) {
 	}
 
 	readAt := time.Now()
-	err := a.ChatService.MarkMessageReadAt(req.MessageID, userIDStr, readAt)
+	err := a.ChatService.MarkMessageReadAt(req.MessageID, req.CharacterID, userIDStr, readAt)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			failMessageNotFound(c)
@@ -480,6 +571,41 @@ func (a *ChatAPI) RecallMessage(c *gin.Context) {
 	}
 
 	response.OkWithMessage(c, "撤回成功")
+}
+
+// PrepareRegenerate 重新生成前置：删除指定的 AI 回复
+// @Summary 删除一条 AI 回复以便客户端重新生成
+// @Tags 聊天模块
+// @Accept json
+// @Produce json
+// @Param message_id path string true "消息ID"
+// @Success 200 {object} response.Response
+// @Router /api/v1/chat/message/{message_id}/regenerate [post]
+func (a *ChatAPI) PrepareRegenerate(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	if userID == nil {
+		failUnauthenticated(c)
+		return
+	}
+	userIDStr := userID.(string)
+
+	messageID := c.Param("message_id")
+	if messageID == "" {
+		response.FailWithMessage(c, "缺少消息ID")
+		return
+	}
+
+	err := a.ChatService.DeleteAssistantMessageForRegenerate(messageID, userIDStr)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			failMessageNotFound(c)
+			return
+		}
+		response.FailWithMessage(c, err.Error())
+		return
+	}
+
+	response.Ok(c)
 }
 
 // GetMessageReadStatus 获取消息已读状态

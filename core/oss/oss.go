@@ -88,3 +88,12 @@ func (o *OSSClient) GetSignedURL(path string, expire time.Duration) (string, err
 	}
 	return signedURL, nil
 }
+
+// Delete removes a private user-owned object from OSS. Public character assets
+// created by the system are never passed to this method during account deletion.
+func (o *OSSClient) Delete(path string) error {
+	if o == nil || o.bucket == nil || path == "" {
+		return fmt.Errorf("OSS client is not configured")
+	}
+	return o.bucket.DeleteObject(path)
+}

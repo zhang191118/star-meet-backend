@@ -2,6 +2,7 @@ package qdrant
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,40 +22,45 @@ type Client struct {
 
 type SearchRequest struct {
 	CollectionName string      `json:"collection_name"`
-	Vector        []float64   `json:"vector"`
-	Limit         int         `json:"limit"`
-	Filter        interface{} `json:"filter,omitempty"`
+	WithPayload    bool        `json:"with_payload"`
+	Vector         []float64   `json:"vector"`
+	Limit          int         `json:"limit"`
+	Filter         interface{} `json:"filter,omitempty"`
 }
 
 type SearchResult struct {
-	Result  []ScoredPoint `json:"result"`
-	Status  string       `json:"status"`
-	Time    float64      `json:"time"`
+	Result []ScoredPoint `json:"result"`
+	Status string        `json:"status"`
+	Time   float64       `json:"time"`
 }
 
 type ScoredPoint struct {
-	ID        interface{}   `json:"id"`
-	Version   int           `json:"version"`
-	Score     float64       `json:"score"`
-	Payload   map[string]interface{} `json:"payload"`
-	Vector    []float64    `json:"vector,omitempty"`
+	ID      interface{}            `json:"id"`
+	Version int                    `json:"version"`
+	Score   float64                `json:"score"`
+	Payload map[string]interface{} `json:"payload"`
+	Vector  []float64              `json:"vector,omitempty"`
 }
 
 type UpsertRequest struct {
-	CollectionName string      `json:"collection_name"`
-	Points         []Point     `json:"points"`
+	CollectionName string  `json:"collection_name"`
+	Points         []Point `json:"points"`
+}
+
+type DeleteRequest struct {
+	Filter interface{} `json:"filter"`
 }
 
 type Point struct {
-	ID        interface{}   `json:"id"`
-	Vector    []float64     `json:"vector"`
-	Payload   map[string]interface{} `json:"payload"`
+	ID      interface{}            `json:"id"`
+	Vector  []float64              `json:"vector"`
+	Payload map[string]interface{} `json:"payload"`
 }
 
 type CreateCollectionRequest struct {
-	Name         string `json:"name"`
-	VectorSize   int    `json:"vector_size"`
-	Distance     string `json:"distance"`
+	Name       string `json:"name"`
+	VectorSize int    `json:"vector_size"`
+	Distance   string `json:"distance"`
 }
 
 func NewClient(baseURL string) *Client {
@@ -75,8 +81,13 @@ func NewClient(baseURL string) *Client {
 
 // Search 搜索相似向量
 func (c *Client) Search(collection string, vector []float64, limit int, filter map[string]interface{}) ([]ScoredPoint, error) {
+	return c.SearchContext(context.Background(), collection, vector, limit, filter)
+}
+
+func (c *Client) SearchContext(ctx context.Context, collection string, vector []float64, limit int, filter map[string]interface{}) ([]ScoredPoint, error) {
 	reqBody := SearchRequest{
 		CollectionName: collection,
+		WithPayload:    true,
 		Vector:         vector,
 		Limit:          limit,
 	}
@@ -85,7 +96,7 @@ func (c *Client) Search(collection string, vector []float64, limit int, filter m
 	}
 
 	jsonBody, _ := json.Marshal(reqBody)
-	req, err := http.NewRequest("POST", c.BaseURL+"/collections/"+collection+"/points/search", bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/collections/"+collection+"/points/search", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %v", err)
 	}
@@ -102,7 +113,7 @@ func (c *Client) Search(collection string, vector []float64, limit int, filter m
 	json.Unmarshal(respBody, &result)
 
 	if result.Status != "ok" {
-		return nil, fmt.Errorf("qdrant search failed: %s", string(respBody))
+		return nil, fmt.Errorf("qdrant search failed: status=%d", resp.StatusCode)
 	}
 
 	return result.Result, nil
@@ -110,16 +121,18 @@ func (c *Client) Search(collection string, vector []float64, limit int, filter m
 
 // Upsert 插入或更新向量
 func (c *Client) Upsert(collection string, points []Point) error {
+	return c.UpsertContext(context.Background(), collection, points)
+}
+
+func (c *Client) UpsertContext(ctx context.Context, collection string, points []Point) error {
 	reqBody := UpsertRequest{
 		CollectionName: collection,
 		Points:         points,
 	}
 
 	jsonBody, _ := json.Marshal(reqBody)
-	fmt.Printf("[Qdrant] Upsert URL: %s\n", c.BaseURL+"/collections/"+collection+"/points")
-	fmt.Printf("[Qdrant] Request body: %s\n", string(jsonBody))
 
-	req, err := http.NewRequest("PUT", c.BaseURL+"/collections/"+collection+"/points", bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/collections/"+collection+"/points?wait=true", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("create request failed: %v", err)
 	}
@@ -131,13 +144,40 @@ func (c *Client) Upsert(collection string, points []Point) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	fmt.Printf("[Qdrant] Response status: %d, body: %s\n", resp.StatusCode, string(respBody))
-
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return fmt.Errorf("qdrant upsert failed (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("qdrant upsert failed: status=%d", resp.StatusCode)
 	}
 
+	return nil
+}
+
+// DeleteByFilter removes all points matching the supplied payload filter.
+func (c *Client) DeleteByFilter(collection string, filter map[string]interface{}) error {
+	return c.DeleteByFilterContext(context.Background(), collection, filter)
+}
+
+func (c *Client) DeleteByFilterContext(ctx context.Context, collection string, filter map[string]interface{}) error {
+	body, err := json.Marshal(DeleteRequest{Filter: filter})
+	if err != nil {
+		return fmt.Errorf("marshal qdrant delete request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/collections/"+collection+"/points/delete?wait=true", bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("create qdrant delete request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return fmt.Errorf("qdrant delete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// A missing collection contains no user vectors and is already clean.
+		return nil
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("qdrant delete failed: status=%d", resp.StatusCode)
+	}
 	return nil
 }
 

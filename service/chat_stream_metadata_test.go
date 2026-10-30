@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,7 @@ func setupChatStreamMetadataTestDB(t *testing.T) *gorm.DB {
 		&database.Character{},
 		&database.Session{},
 		&database.Message{},
+		&database.Block{},
 	); err != nil {
 		t.Fatalf("migrate chat tables: %v", err)
 	}
@@ -59,7 +61,7 @@ func TestStreamMessageMetaIncludesClientAndSessionIDs(t *testing.T) {
 	}
 
 	service := &ChatService{DB: db}
-	events, errs := service.StreamMessage("stream-user", "stream-char", "你好", "text", "client-user-msg", "client-reply-msg")
+	events, errs := service.StreamMessage("stream-user", "stream-char", "你好", "text", "client-user-msg", "client-reply-msg", "")
 
 	event := <-events
 	if event.Type != "meta" || event.Meta == nil {
@@ -78,21 +80,54 @@ func TestStreamMessageMetaIncludesClientAndSessionIDs(t *testing.T) {
 		t.Fatalf("expected created_at in meta, got %+v", event.Meta)
 	}
 
-	event = <-events
-	if event.Type != "content" || strings.TrimSpace(event.Content) == "" {
-		t.Fatalf("expected fallback content after metadata when streaming client is unavailable, got %+v", event)
+	if err := <-errs; !errors.Is(err, ErrAIServiceUnavailable) {
+		t.Fatalf("expected unavailable stream client to report AI unavailable, got %v", err)
 	}
 
-	if err := <-errs; err != nil {
-		t.Fatalf("expected unavailable stream client to fall back without error, got %v", err)
+	var assistantCount int64
+	if err := db.Model(&database.Message{}).Where("message_id = ? AND role = ?", "client-reply-msg", "assistant").Count(&assistantCount).Error; err != nil {
+		t.Fatalf("count assistant replies: %v", err)
+	}
+	if assistantCount != 0 {
+		t.Fatalf("expected unavailable AI to avoid saving a template reply, got %d assistant messages", assistantCount)
+	}
+}
+
+func TestSendMessageDoesNotPersistTemplateWhenAIUnavailable(t *testing.T) {
+	db := setupChatStreamMetadataTestDB(t)
+	if err := db.Create(&database.User{UserID: "send-unavailable-user", Nickname: "发送用户"}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := db.Create(&database.Character{
+		CharacterID:  "send-unavailable-char",
+		UserID:       "system_admin",
+		Name:         "发送角色",
+		Gender:       "female",
+		Relationship: "恋人",
+		IsPublic:     1,
+	}).Error; err != nil {
+		t.Fatalf("create character: %v", err)
 	}
 
-	var reply database.Message
-	if err := db.Where("message_id = ? AND role = ?", "client-reply-msg", "assistant").First(&reply).Error; err != nil {
-		t.Fatalf("expected fallback assistant reply to be saved: %v", err)
+	service := &ChatService{DB: db}
+	_, err := service.SendMessageWithIDs(
+		"send-unavailable-user",
+		"send-unavailable-char",
+		"你好",
+		"text",
+		"send-unavailable-user-message",
+		"send-unavailable-reply-message",
+	)
+	if !errors.Is(err, ErrAIServiceUnavailable) {
+		t.Fatalf("expected AI unavailable error, got %v", err)
 	}
-	if strings.TrimSpace(reply.Content) == "" {
-		t.Fatal("expected saved fallback reply content")
+
+	var assistantCount int64
+	if err := db.Model(&database.Message{}).Where("role = ?", "assistant").Count(&assistantCount).Error; err != nil {
+		t.Fatalf("count assistant replies: %v", err)
+	}
+	if assistantCount != 0 {
+		t.Fatalf("expected no assistant template reply, got %d messages", assistantCount)
 	}
 }
 
@@ -140,7 +175,7 @@ func TestStreamMessageReusesCompletedClientMessage(t *testing.T) {
 	}
 
 	service := &ChatService{DB: db}
-	events, errs := service.StreamMessage("retry-user", "retry-char", "重复请求", "text", "retry-user-msg", "retry-reply-msg")
+	events, errs := service.StreamMessage("retry-user", "retry-char", "重复请求", "text", "retry-user-msg", "retry-reply-msg", "")
 
 	event := <-events
 	if event.Type != "meta" || event.Meta == nil {
@@ -148,6 +183,9 @@ func TestStreamMessageReusesCompletedClientMessage(t *testing.T) {
 	}
 	if event.Meta.SessionID != "retry-session" || event.Meta.UserMessageID != "retry-user-msg" || event.Meta.ReplyMessageID != "retry-reply-msg" {
 		t.Fatalf("unexpected reuse metadata: %+v", event.Meta)
+	}
+	if replay := <-events; replay.Type != "content" || replay.Content != "已经回复过了" {
+		t.Fatalf("retry must replay the committed reply, got %+v", replay)
 	}
 	if err := <-errs; err != nil {
 		t.Fatalf("expected completed retry to avoid AI generation error, got %v", err)
@@ -203,7 +241,7 @@ func TestStreamMessageReportsAssistantSaveError(t *testing.T) {
 	}
 
 	service := &ChatService{DB: db, MiniMaxClient: client}
-	events, errs := service.StreamMessage("save-error-user", "save-error-char", "触发保存错误", "text", "save-error-user-msg", "conflicting-reply-id")
+	events, errs := service.StreamMessage("save-error-user", "save-error-char", "触发保存错误", "text", "save-error-user-msg", "conflicting-reply-id", "")
 
 	if event := <-events; event.Type != "meta" {
 		t.Fatalf("expected first event to be meta, got %+v", event)

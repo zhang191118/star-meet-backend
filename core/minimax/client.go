@@ -3,6 +3,7 @@ package minimax
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,9 @@ type GenerateRequest struct {
 type StreamResponse struct {
 	ID      string         `json:"id"`
 	Choices []StreamChoice `json:"choices"`
+	Error   *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 type StreamChoice struct {
@@ -59,6 +63,10 @@ func NewClient(apiKey string) *Client {
 
 // StreamGenerate 调用 MiniMax API 生成流式回复
 func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens int) (<-chan string, <-chan error) {
+	return c.StreamGenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) StreamGenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (<-chan string, <-chan error) {
 	ch := make(chan string)
 	errCh := make(chan error, 1)
 
@@ -96,7 +104,11 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 
 		jsonBody, _ := json.Marshal(reqBody)
 
-		req, _ := http.NewRequest("POST", APIURL, bytes.NewBuffer(jsonBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", APIURL, bytes.NewBuffer(jsonBody))
+		if err != nil {
+			errCh <- err
+			return
+		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
@@ -108,43 +120,53 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
-			errCh <- fmt.Errorf("minimax api error: %d - %s", resp.StatusCode, string(body))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			errCh <- fmt.Errorf("minimax api error: status=%d", resp.StatusCode)
 			return
 		}
 
-		reader := bufio.NewReader(resp.Body)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				errCh <- err
-				return
-			}
-
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "data: ") {
+		reader := bufio.NewScanner(resp.Body)
+		reader.Buffer(make([]byte, 4096), 1024*1024)
+		for reader.Scan() {
+			line := strings.TrimSpace(reader.Text())
+			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
 
-			data := strings.TrimPrefix(line, "data: ")
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "[DONE]" {
-				break
+				return
 			}
 
 			var genResp StreamResponse
 			if err := json.Unmarshal([]byte(data), &genResp); err != nil {
 				continue
 			}
+			if genResp.Error != nil {
+				errCh <- fmt.Errorf("minimax provider returned an error")
+				return
+			}
 
 			if len(genResp.Choices) > 0 {
 				content := genResp.Choices[0].Delta.Content
 				if content != "" {
-					ch <- content
+					select {
+					case ch <- content:
+					case <-ctx.Done():
+						errCh <- ctx.Err()
+						return
+					}
+				}
+				// Some OpenAI-compatible providers serialise "null" as a string.
+				if reason := strings.ToLower(strings.TrimSpace(genResp.Choices[0].FinishReason)); reason != "" && reason != "null" {
+					return
 				}
 			}
+		}
+		if err := reader.Err(); err != nil {
+			errCh <- err
+		} else {
+			errCh <- io.ErrUnexpectedEOF
 		}
 	}()
 
@@ -153,6 +175,10 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 
 // Generate 调用 MiniMax API 生成回复 (非流式)
 func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (string, error) {
+	return c.GenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) GenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (string, error) {
 	if c.APIKey == "" {
 		return "", fmt.Errorf("minimax api key not configured")
 	}
@@ -180,7 +206,10 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 
 	jsonBody, _ := json.Marshal(reqBody)
 
-	req, _ := http.NewRequest("POST", APIURL, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", APIURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
@@ -191,8 +220,7 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("minimax api error: %d - %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("minimax api error: status=%d", resp.StatusCode)
 	}
 
 	var genResp struct {

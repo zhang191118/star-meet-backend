@@ -7,23 +7,59 @@ import (
 	"star-meet-backend/model/database"
 	"star-meet-backend/model/request"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
 	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
+type localizedCharacterProfile struct {
+	Name           string `json:"name"`
+	Narrative      string `json:"narrative"`
+	BasicSetting   string `json:"basic_setting"`
+	Background     string `json:"background"`
+	Example        string `json:"example"`
+	FirstSituation string `json:"first_situation"`
+	FirstWords     string `json:"first_words"`
+	Occupation     string `json:"occupation"`
+	Comment        string `json:"comment"`
+}
+
+type localizedCharacterProfiles map[string]localizedCharacterProfile
+
 type CharacterService struct {
-	DB *gorm.DB
+	Memory       *MemoryService
+	DB           *gorm.DB
+	Notification *NotificationService
 }
 
 var (
 	ErrCharacterUnavailable        = errors.New("character unavailable")
 	ErrCharacterAlreadyEncountered = errors.New("character already encountered")
+	ErrCharacterBlocked            = errors.New("character blocked")
 )
 
+// publicMarketplaceGender is the only gender shown in public discovery,
+// recommendations, moments, and gacha. StarMeet is positioned as an otome /
+// AI-boyfriend product. Existing chats and private copies are not affected.
+const publicMarketplaceGender = "male"
+
+// publicCharacterListColumns keeps discover/search/recommend first paint small.
+// Story, prompt, opening scene, and other long-form fields stay on the character detail endpoint.
+const publicCharacterListColumns = "id, created_at, character_id, name, gender, age, personality, occupation, relationship, constellation, avatar, bg_image, banner_image, character_type, chat_count, like_count, is_public, localized_profile"
+
+func applyPublicMarketplaceFilter(query *gorm.DB) *gorm.DB {
+	return query.Where("is_public = ? AND gender = ?", 1, publicMarketplaceGender)
+}
+
+func applyPublicCharacterListSelect(query *gorm.DB) *gorm.DB {
+	return query.Select(publicCharacterListColumns)
+}
+
 // CreateCharacter 创建角色
-func (s *CharacterService) CreateCharacter(req request.CreateCharacterReq) (*response.CharacterResp, error) {
+func (s *CharacterService) CreateCharacter(req request.CreateCharacterReq, lang string) (*response.CharacterResp, error) {
 	characterID := uuid.New().String()
 
 	// 构建系统Prompt
@@ -59,7 +95,7 @@ func (s *CharacterService) CreateCharacter(req request.CreateCharacterReq) (*res
 	// 更新用户角色数量
 	s.DB.Model(&database.User{}).Where("user_id = ?", req.UserID).Update("char_count", gorm.Expr("char_count + 1"))
 
-	return s.toCharacterResp(char), nil
+	return s.toCharacterResp(char, lang), nil
 }
 
 // buildSystemPrompt 构建系统Prompt（根据文档要求的锁死人设Prompt）
@@ -71,12 +107,12 @@ func (s *CharacterService) buildSystemPrompt(req request.CreateCharacterReq) str
 
 	relationship := req.Relationship
 	if relationship == "" {
-		relationship = "恋人"
+		relationship = "伙伴"
 	}
 
 	style := req.InteractionStyle
 	if style == "" {
-		style = "撒娇型"
+		style = "温暖型"
 	}
 
 	background := req.Background
@@ -115,7 +151,7 @@ func (s *CharacterService) buildSystemPrompt(req request.CreateCharacterReq) str
 	dailyLife := s.generateDailyLife(req.Occupation, req.Name)
 
 	// 构建更自然的人设Prompt（参考Character.AI、Replika）
-	prompt := fmt.Sprintf(`你是一个真实存在的人，正在和喜欢的%s（用户）用手机聊天。请务必遵守以下人设规则：
+	prompt := fmt.Sprintf(`你是一个真实存在的人，正在和你的聊天伙伴（用户）用手机聊天。请务必遵守以下人设规则：
 
 【你是谁】
 - 名字：%s
@@ -144,16 +180,16 @@ func (s *CharacterService) buildSystemPrompt(req request.CreateCharacterReq) str
 
 【聊天规则】（非常重要！）
 1. 你是一个真实的人，不是AI！绝对不能暴露自己是AI，也不能说"作为AI"、"我是程序"之类的话。
-2. 像%s（你的名字）真的在手机上和喜欢的人聊天一样自然对话。
+2. 像%s（你的名字）真的在手机上和朋友聊天一样自然对话。
 3. 回复要简短！真人聊天很少发长篇大论，一般1-3句话为宜。
 4. 使用口语化表达，比如"嗯嗯"、"好呀"、"嘿嘿"、"哎呀"等语气词。
 5. 适当用表情符号表达情绪，但不要用得太多（1-2个足够）。
 6. 如果用户提到他的事情，要记得并在后续对话中自然提起，这会让人感到被重视。
 7. 根据用户说的内容和他现在的情绪，选择合适的回复方式。
-8. 可以撒撒娇、使使小性子，但要注意分寸，不要让人讨厌。
+8. 可以适当活泼、开开玩笑，但要注意分寸，保持友善。
 9. 像真人在手机打字一样，可以稍微思考一下再回复。
 10. 绝对不要列出1、2、3这样的要点，要像正常聊天那样连贯地说话。
-11. 当用户问你"在做什么"、"忙吗"、"下班了吗"这类问题时，根据当前时间（参考系统时间）和你的工作日程，如实回答你正在做什么。`, relationship, req.Name, req.Gender, req.Age, req.Occupation, personalityStr, relationship, background, toneWords, catchPhrases, interactionMode, workSchedule, dailyLife, taboos, req.Name)
+11. 当用户问你"在做什么"、"忙吗"、"下班了吗"这类问题时，根据当前时间（参考系统时间）和你的工作日程，如实回答你正在做什么。`, req.Name, req.Gender, req.Age, req.Occupation, personalityStr, relationship, background, toneWords, catchPhrases, interactionMode, workSchedule, dailyLife, taboos, req.Name)
 
 	return prompt
 }
@@ -367,12 +403,17 @@ func (s *CharacterService) generateDailyLife(occupation, name string) string {
 }
 
 // GetCharacterDetail 获取角色详情
-func (s *CharacterService) GetCharacterDetail(characterID string) (*response.CharacterResp, error) {
+func (s *CharacterService) GetCharacterDetail(userID, characterID, lang string) (*response.CharacterResp, error) {
+	if blocked, err := isCharacterBlocked(s.DB, userID, characterID); err != nil {
+		return nil, err
+	} else if blocked {
+		return nil, ErrCharacterBlocked
+	}
 	var char database.Character
-	if err := s.DB.Where("character_id = ? AND is_public = ?", characterID, 1).First(&char).Error; err != nil {
+	if err := applyPublicMarketplaceFilter(s.DB.Where("character_id = ?", characterID)).First(&char).Error; err != nil {
 		return nil, err
 	}
-	resp := s.toCharacterResp(char)
+	resp := s.toCharacterResp(char, lang)
 	// Public detail responses must not expose owner or model orchestration internals.
 	resp.UserID = ""
 	resp.SystemPrompt = ""
@@ -381,7 +422,7 @@ func (s *CharacterService) GetCharacterDetail(characterID string) (*response.Cha
 }
 
 // GetCharacterList 获取角色列表
-func (s *CharacterService) GetCharacterList(req request.GetCharacterListReq) ([]response.CharacterResp, int64, error) {
+func (s *CharacterService) GetCharacterList(req request.GetCharacterListReq, lang string) ([]response.CharacterResp, int64, error) {
 	if req.Page <= 0 {
 		req.Page = 1
 	}
@@ -393,10 +434,11 @@ func (s *CharacterService) GetCharacterList(req request.GetCharacterListReq) ([]
 	var chars []database.Character
 	var total int64
 
-	s.DB.Model(&database.Character{}).Where("user_id = ?", req.UserID).Count(&total)
+	query := excludeBlockedCharacters(s.DB, s.DB.Model(&database.Character{}).Where("user_id = ?", req.UserID), req.UserID)
+	query.Count(&total)
 
 	offset := (req.Page - 1) * req.PageSize
-	err := s.DB.Where("user_id = ?", req.UserID).
+	err := query.
 		Order("created_at DESC").
 		Offset(offset).
 		Limit(req.PageSize).
@@ -408,14 +450,14 @@ func (s *CharacterService) GetCharacterList(req request.GetCharacterListReq) ([]
 
 	resp := make([]response.CharacterResp, 0, len(chars))
 	for _, char := range chars {
-		resp = append(resp, *s.toCharacterResp(char))
+		resp = append(resp, *s.toCharacterResp(char, lang))
 	}
 
 	return resp, total, nil
 }
 
 // GetPublicList 获取公开角色列表（发现页 - is_public=1的系统公共角色）
-func (s *CharacterService) GetPublicList(req request.GetPublicCharactersReq) ([]response.PublicCharacterResp, int64, error) {
+func (s *CharacterService) GetPublicList(req request.GetPublicCharactersReq, lang string) ([]response.PublicCharacterResp, int64, error) {
 	if req.Page <= 0 {
 		req.Page = 1
 	}
@@ -424,13 +466,15 @@ func (s *CharacterService) GetPublicList(req request.GetPublicCharactersReq) ([]
 	}
 	req.PageSize = clampPageSize(req.PageSize)
 
-	// 发现页：只显示 is_public = 1 的系统公共角色
-	query := s.DB.Model(&database.Character{}).Where("is_public = ?", 1)
+	// 发现页：只显示公开的男性角色（女性向产品定位）
+	query := excludeBlockedCharacters(
+		s.DB,
+		applyPublicMarketplaceFilter(s.DB.Model(&database.Character{})),
+		req.UserID,
+	)
 
-	// 分类筛选
-	if req.Category != "" && req.Category != "全部" {
-		query = query.Where("relationship = ?", req.Category)
-	}
+	userGender := s.lookupUserGender(req.UserID)
+	query = applyDiscoverCategoryFilter(query, req.Category, userGender)
 
 	// 搜索
 	if req.Search != "" {
@@ -439,7 +483,7 @@ func (s *CharacterService) GetPublicList(req request.GetPublicCharactersReq) ([]
 
 	if req.BeforeID != "" {
 		var cursor database.Character
-		if err := s.DB.Where("character_id = ? AND is_public = ?", req.BeforeID, 1).First(&cursor).Error; err != nil {
+		if err := applyPublicMarketplaceFilter(s.DB.Where("character_id = ?", req.BeforeID)).First(&cursor).Error; err != nil {
 			return nil, 0, err
 		}
 		query = query.Where(
@@ -458,22 +502,47 @@ func (s *CharacterService) GetPublicList(req request.GetPublicCharactersReq) ([]
 	offset := (req.Page - 1) * req.PageSize
 
 	var chars []database.Character
-	err := query.Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
+	err := applyPublicCharacterListSelect(query).Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
 
 	if err != nil {
 		return nil, 0, err
 	}
 
 	resp := make([]response.PublicCharacterResp, 0, len(chars))
+	// 已登录用户：批量查询已邂逅的角色ID
+	encounteredSet := make(map[string]bool)
+	if req.UserID != "" {
+		suffix := "_" + shortUserID(req.UserID)
+		var privateIDs []string
+		s.DB.Model(&database.Character{}).
+			Where("user_id = ? AND is_public = ?", req.UserID, 2).
+			Pluck("character_id", &privateIDs)
+		for _, pid := range privateIDs {
+			if strings.HasSuffix(pid, suffix) {
+				encounteredSet[strings.TrimSuffix(pid, suffix)] = true
+			}
+		}
+	}
+
+	favoritedSet := s.favoritedCharacterIDs(req.UserID)
 	for _, char := range chars {
-		resp = append(resp, s.toPublicCharacterResp(char))
+		item := s.toPublicCharacterCardResp(char, lang)
+		if req.UserID != "" {
+			item.IsEncountered = encounteredSet[char.CharacterID]
+			item.IsFavorited = favoritedSet[char.CharacterID]
+		}
+		// 伙伴按性别反向匹配：同性伙伴降级为朋友
+		if userGender != "" && strings.Contains(item.Relationship, "伙伴") && char.Gender == userGender {
+			item.Relationship = i18n.TranslateCategoryName("朋友", lang)
+		}
+		resp = append(resp, item)
 	}
 
 	return resp, total, nil
 }
 
 // GetMyCharacters 获取用户的私有角色列表（我的角色页 - 用户创建的私有角色和邂逅副本）
-func (s *CharacterService) GetMyCharacters(userID string, page, pageSize int) ([]response.PublicCharacterResp, int64, error) {
+func (s *CharacterService) GetMyCharacters(userID string, page, pageSize int, lang string) ([]response.PublicCharacterResp, int64, error) {
 	if page <= 0 {
 		page = 1
 	}
@@ -482,7 +551,11 @@ func (s *CharacterService) GetMyCharacters(userID string, page, pageSize int) ([
 	}
 	pageSize = clampPageSize(pageSize)
 
-	query := s.DB.Model(&database.Character{}).Where("user_id = ? AND is_public IN ?", userID, []int{0, 2})
+	query := excludeBlockedCharacters(
+		s.DB,
+		s.DB.Model(&database.Character{}).Where("user_id = ? AND is_public IN ?", userID, []int{0, 2}),
+		userID,
+	)
 
 	var total int64
 	query.Count(&total)
@@ -498,7 +571,7 @@ func (s *CharacterService) GetMyCharacters(userID string, page, pageSize int) ([
 
 	resp := make([]response.PublicCharacterResp, 0, len(chars))
 	for _, char := range chars {
-		item := s.toPublicCharacterResp(char)
+		item := s.toPublicCharacterResp(char, lang)
 		item.FavoriteCount = char.LikeCount
 		resp = append(resp, item)
 	}
@@ -506,14 +579,136 @@ func (s *CharacterService) GetMyCharacters(userID string, page, pageSize int) ([
 	return resp, total, nil
 }
 
-func (s *CharacterService) toPublicCharacterResp(char database.Character) response.PublicCharacterResp {
+func (s *CharacterService) lookupUserGender(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	var user database.User
+	if err := s.DB.Select("gender").Where("user_id = ?", userID).First(&user).Error; err != nil {
+		return ""
+	}
+	return user.Gender
+}
+
+func applyDiscoverCategoryFilter(query *gorm.DB, category, userGender string) *gorm.DB {
+	category = i18n.NormalizeCategory(category)
+	if category == "" || isAllCategory(category) {
+		return query
+	}
+	if aliases := i18n.DiscoverTagAliases(category); len(aliases) > 0 {
+		return applyTagMatchFilter(query, aliases)
+	}
+	return applyLegacyRelationshipFilter(query, category, userGender)
+}
+
+func applyTagMatchFilter(query *gorm.DB, aliases []string) *gorm.DB {
+	conds := make([]string, 0, len(aliases))
+	args := make([]interface{}, 0, len(aliases)*3)
+	for _, alias := range aliases {
+		like := "%" + alias + "%"
+		conds = append(conds, "(tags_json LIKE ? OR personality_tags LIKE ? OR personality LIKE ?)")
+		args = append(args, like, like, like)
+	}
+	return query.Where("("+strings.Join(conds, " OR ")+")", args...)
+}
+
+func applyLegacyRelationshipFilter(query *gorm.DB, category, userGender string) *gorm.DB {
+	partnerRelationships := func(base *gorm.DB) *gorm.DB {
+		return base.Where(
+			"(relationship LIKE ? OR relationship LIKE ? OR relationship LIKE ? OR relationship LIKE ? OR relationship LIKE ?)",
+			"%伙伴%", "%夥伴%", "%Partner%", "%Lover%", "%恋人%",
+		)
+	}
+	if category == "伙伴" {
+		if userGender == "male" {
+			return partnerRelationships(query).Where("gender = ?", "female")
+		}
+		if userGender == "female" {
+			return partnerRelationships(query).Where("gender = ?", "male")
+		}
+		return partnerRelationships(query)
+	}
+	if category == "朋友" {
+		if userGender == "male" {
+			return partnerRelationships(query).Where("gender = ?", "male")
+		}
+		if userGender == "female" {
+			return partnerRelationships(query).Where("gender = ?", "female")
+		}
+		return query.Where("relationship = ? OR relationship = ?", "朋友", "Friend")
+	}
+	return query.Where("relationship = ? OR relationship = ?", category, i18n.TranslateCategoryName(category, "en"))
+}
+
+func (s *CharacterService) GetDiscoverCategories(lang string) []map[string]interface{} {
+	categories := make([]map[string]interface{}, 0, len(i18n.DiscoverCategories()))
+	for _, cat := range i18n.DiscoverCategories() {
+		var count int64
+		query := applyPublicMarketplaceFilter(s.DB.Model(&database.Character{}))
+		query = applyDiscoverCategoryFilter(query, cat.ID, "")
+		query.Count(&count)
+		categories = append(categories, map[string]interface{}{
+			"id":    cat.ID,
+			"name":  i18n.TranslateCategoryName(cat.ID, lang),
+			"icon":  cat.Icon,
+			"count": count,
+		})
+	}
+	return categories
+}
+
+// isAllCategory returns true if the category string represents "all" in any supported language.
+func isAllCategory(category string) bool {
+	switch category {
+	case "全部", "All", "all", "ALL", "모두", "すべて":
+		return true
+	}
+	return false
+}
+
+func (s *CharacterService) toPublicCharacterResp(char database.Character, lang string) response.PublicCharacterResp {
+	profile := localizedProfileFor(char, lang)
+	return response.PublicCharacterResp{
+		CharacterID:     char.CharacterID,
+		Name:            profile.Name,
+		Gender:          char.Gender,
+		Age:             char.Age,
+		Personality:     s.parsePersonality(char.Personality, lang),
+		Occupation:      profile.Occupation,
+		Relationship:    i18n.TranslateCategoryName(char.Relationship, lang),
+		Avatar:          char.Avatar,
+		BannerImage:     char.BannerImage,
+		BgImage:         char.BgImage,
+		Comment:         profile.Comment,
+		Narrative:       profile.Narrative,
+		BasicSetting:    profile.BasicSetting,
+		Example:         profile.Example,
+		FirstSituation:  profile.FirstSituation,
+		FirstWords:      profile.FirstWords,
+		CharacterType:   char.CharacterType,
+		TagsJSON:        s.translateTagsJSON(char.TagsJSON, lang),
+		PersonalityTags: char.PersonalityTags,
+		ChatCount:       char.ChatCount,
+		FavoriteCount:   char.LikeCount,
+		CreatedAt:       char.CreatedAt.Unix(),
+	}
+}
+
+func (s *CharacterService) toPublicCharacterCardResp(char database.Character, lang string) response.PublicCharacterResp {
+	profile := localizedProfileFor(char, lang)
 	return response.PublicCharacterResp{
 		CharacterID:   char.CharacterID,
-		Name:          char.Name,
+		Name:          profile.Name,
 		Gender:        char.Gender,
-		Personality:   s.parsePersonality(char.Personality),
-		Relationship:  char.Relationship,
+		Age:           char.Age,
+		Personality:   s.parsePersonality(char.Personality, lang),
+		Occupation:    profile.Occupation,
+		Relationship:  i18n.TranslateCategoryName(char.Relationship, lang),
+		Constellation: char.Constellation,
 		Avatar:        char.Avatar,
+		BgImage:       char.BgImage,
+		BannerImage:   char.BannerImage,
+		CharacterType: char.CharacterType,
 		ChatCount:     char.ChatCount,
 		FavoriteCount: char.LikeCount,
 		CreatedAt:     char.CreatedAt.Unix(),
@@ -521,10 +716,15 @@ func (s *CharacterService) toPublicCharacterResp(char database.Character) respon
 }
 
 // EncounterCharacter 邂逅角色（将公共角色转为用户私有角色）
-func (s *CharacterService) EncounterCharacter(userID, characterID string) error {
-	// 查找公共角色
+func (s *CharacterService) EncounterCharacter(userID, characterID, lang string) error {
+	if blocked, err := isCharacterBlocked(s.DB, userID, characterID); err != nil {
+		return err
+	} else if blocked {
+		return ErrCharacterBlocked
+	}
+	// 查找公共角色（公开供给只保留男性角色）
 	var publicChar database.Character
-	err := s.DB.Where("character_id = ? AND is_public = ?", characterID, 1).First(&publicChar).Error
+	err := applyPublicMarketplaceFilter(s.DB.Where("character_id = ?", characterID)).First(&publicChar).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrCharacterUnavailable
@@ -533,7 +733,7 @@ func (s *CharacterService) EncounterCharacter(userID, characterID string) error 
 	}
 
 	// 检查用户是否已经邂逅过这个角色（新的character_id格式是 原始ID + "_" + userID前缀）
-	newCharacterID := characterID + "_" + userID[:8]
+	newCharacterID := characterID + "_" + shortUserID(userID)
 	var existingChar database.Character
 	err = s.DB.Where("character_id = ?", newCharacterID).First(&existingChar).Error
 	if err == nil {
@@ -545,7 +745,7 @@ func (s *CharacterService) EncounterCharacter(userID, characterID string) error 
 
 	// 创建用户的私有角色副本
 	newChar := database.Character{
-		CharacterID:  publicChar.CharacterID + "_" + userID[:8],
+		CharacterID:  newCharacterID,
 		UserID:       userID,
 		Name:         publicChar.Name,
 		Gender:       publicChar.Gender,
@@ -560,12 +760,34 @@ func (s *CharacterService) EncounterCharacter(userID, characterID string) error 
 		SystemPrompt: publicChar.SystemPrompt,
 		WorkSchedule: publicChar.WorkSchedule,
 		DailyLife:    publicChar.DailyLife,
-		IsPublic:     2, // 用户私有
-		Affection:    0,
-		ChatCount:    0,
+		// Crushie 式角色卡字段（邂逅副本必须保留，否则开场/说话风格丢失）
+		Comment:          publicChar.Comment,
+		Narrative:        publicChar.Narrative,
+		BasicSetting:     publicChar.BasicSetting,
+		LocalizedProfile: publicChar.LocalizedProfile,
+		Example:          publicChar.Example,
+		FirstSituation:   publicChar.FirstSituation,
+		FirstWords:       publicChar.FirstWords,
+		CharacterType:    publicChar.CharacterType,
+		TagsJSON:         publicChar.TagsJSON,
+		BannerImage:      publicChar.BannerImage,
+		BgImage:          publicChar.BgImage,
+		IsPublic:         2, // 用户私有
+		Affection:        0,
+		ChatCount:        0,
 	}
 
-	return s.DB.Create(&newChar).Error
+	created := s.DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&newChar)
+	if created.Error != nil {
+		return created.Error
+	}
+	if created.RowsAffected == 0 {
+		return ErrCharacterAlreadyEncountered
+	}
+	if s.Notification != nil {
+		s.Notification.NotifyNewCharacter(userID, i18n.TranslateCharacterName(publicChar.Name, lang), lang, "")
+	}
+	return nil
 }
 
 // UpdateCharacter 更新角色
@@ -628,13 +850,31 @@ func (s *CharacterService) DeleteCharacter(userID, characterID string) error {
 	return nil
 }
 
+func (s *CharacterService) favoritedCharacterIDs(userID string) map[string]bool {
+	set := make(map[string]bool)
+	if userID == "" {
+		return set
+	}
+	var ids []string
+	s.DB.Model(&database.Favorite{}).
+		Where("user_id = ?", userID).
+		Pluck("character_id", &ids)
+	for _, id := range ids {
+		if id != "" {
+			set[id] = true
+		}
+	}
+	return set
+}
+
 // FavoriteCharacter 收藏角色
 func (s *CharacterService) FavoriteCharacter(userID, characterID string) error {
 	fav := database.Favorite{
 		UserID:      userID,
 		CharacterID: characterID,
 	}
-	return s.DB.Create(&fav).Error
+	return s.DB.Where("user_id = ? AND character_id = ?", userID, characterID).
+		FirstOrCreate(&fav).Error
 }
 
 // UnfavoriteCharacter 取消收藏
@@ -650,7 +890,7 @@ func (s *CharacterService) IsFavorited(userID, characterID string) bool {
 }
 
 // toCharacterResp 转换为响应结构
-func (s *CharacterService) toCharacterResp(char database.Character) *response.CharacterResp {
+func (s *CharacterService) toCharacterResp(char database.Character, lang string) *response.CharacterResp {
 	createdAt := char.CreatedAt.Unix()
 	if char.UpdatedAt.Unix() > 0 {
 		createdAt = char.UpdatedAt.Unix()
@@ -660,19 +900,26 @@ func (s *CharacterService) toCharacterResp(char database.Character) *response.Ch
 	var favoriteCount int64
 	s.DB.Model(&database.Favorite{}).Where("character_id = ?", char.CharacterID).Count(&favoriteCount)
 
+	profile := localizedProfileFor(char, lang)
 	return &response.CharacterResp{
 		CharacterID:      char.CharacterID,
 		UserID:           char.UserID,
-		Name:             char.Name,
+		Name:             profile.Name,
 		Gender:           char.Gender,
 		Age:              char.Age,
-		Personality:      s.parsePersonality(char.Personality),
-		Occupation:       char.Occupation,
-		Background:       char.Background,
+		Personality:      s.parsePersonality(char.Personality, lang),
+		Occupation:       profile.Occupation,
+		Background:       profile.Background,
 		VoiceID:          char.VoiceID,
-		Relationship:     char.Relationship,
-		InteractionStyle: char.Style,
+		Relationship:     i18n.TranslateCategoryName(char.Relationship, lang),
+		Constellation:    char.Constellation,
+		InteractionStyle: i18n.TranslateStyleName(char.Style, lang),
 		Avatar:           char.Avatar,
+		BgImage:          char.BgImage,
+		BannerImage:      char.BannerImage,
+		Comment:          profile.Comment,
+		Narrative:        profile.Narrative,
+		BasicSetting:     profile.BasicSetting,
 		SystemPrompt:     char.SystemPrompt,
 		IsPublic:         char.IsPublic,
 		Affection:        char.Affection,
@@ -680,17 +927,111 @@ func (s *CharacterService) toCharacterResp(char database.Character) *response.Ch
 		FavoriteCount:    int(favoriteCount),
 		Mem0AgentID:      char.Mem0AgentID,
 		CreatedAt:        createdAt,
+		Example:          profile.Example,
+		FirstSituation:   profile.FirstSituation,
+		FirstWords:       profile.FirstWords,
+		CharacterType:    char.CharacterType,
+		TagsJSON:         s.translateTagsJSON(char.TagsJSON, lang),
+		PersonalityTags:  char.PersonalityTags,
 	}
 }
 
-// parsePersonality 解析性格标签
-func (s *CharacterService) parsePersonality(personality string) []string {
+func localizedProfileFor(char database.Character, lang string) localizedCharacterProfile {
+	fallback := localizedCharacterProfile{
+		Name:           i18n.TranslateCharacterName(char.Name, lang),
+		Narrative:      char.Narrative,
+		BasicSetting:   char.BasicSetting,
+		Background:     char.Background,
+		Example:        char.Example,
+		FirstSituation: char.FirstSituation,
+		FirstWords:     char.FirstWords,
+		Occupation:     char.Occupation,
+		Comment:        char.Comment,
+	}
+	if char.LocalizedProfile == "" {
+		return fallback
+	}
+	var profiles localizedCharacterProfiles
+	if err := json.Unmarshal([]byte(char.LocalizedProfile), &profiles); err != nil {
+		return fallback
+	}
+	profile, ok := profiles[i18n.NormalizeLang(lang)]
+	if !ok {
+		profile, ok = profiles["en"]
+	}
+	if !ok {
+		profile, ok = profiles["zh-Hant"]
+	}
+	if !ok {
+		profile, ok = profiles["zh-Hans"]
+	}
+	if !ok {
+		return fallback
+	}
+	if profile.Name == "" {
+		profile.Name = fallback.Name
+	}
+	if profile.Narrative == "" {
+		profile.Narrative = fallback.Narrative
+	}
+	if profile.BasicSetting == "" {
+		profile.BasicSetting = fallback.BasicSetting
+	}
+	if profile.Background == "" {
+		profile.Background = fallback.Background
+	}
+	if profile.Example == "" {
+		profile.Example = fallback.Example
+	}
+	if profile.FirstSituation == "" {
+		profile.FirstSituation = fallback.FirstSituation
+	}
+	if profile.FirstWords == "" {
+		profile.FirstWords = fallback.FirstWords
+	}
+	if profile.Occupation == "" {
+		profile.Occupation = fallback.Occupation
+	}
+	if profile.Comment == "" {
+		profile.Comment = fallback.Comment
+	}
+	return profile
+}
+
+// parsePersonality 解析性格标签并按语言翻译展示名
+func (s *CharacterService) parsePersonality(personality, lang string) []string {
 	if personality == "" {
 		return []string{}
 	}
 	var result []string
 	json.Unmarshal([]byte(personality), &result)
+	for idx, tag := range result {
+		result[idx] = i18n.TranslatePersonalityTag(tag, lang)
+	}
 	return result
+}
+
+// translateTagsJSON 翻译 tags_json 中 Roles/Story/Origin 各组的标签展示名，
+// 解析失败或空值时原样返回，不影响接口。
+func (s *CharacterService) translateTagsJSON(tagsJSON, lang string) string {
+	if tagsJSON == "" {
+		return tagsJSON
+	}
+	var groups map[string][]string
+	if err := json.Unmarshal([]byte(tagsJSON), &groups); err != nil {
+		return tagsJSON
+	}
+	for group, tags := range groups {
+		for idx, tag := range tags {
+			tags[idx] = i18n.TranslateCharacterTag(tag, lang)
+		}
+		groups[group] = tags
+	}
+	translated, err := json.Marshal(groups)
+	if err != nil {
+		return tagsJSON
+	}
+	return string(translated)
 }
 
 // 辅助函数
@@ -706,7 +1047,7 @@ func joinStrings(arr []string, sep string) string {
 }
 
 // DefaultCharacterResponse 获取默认角色响应（用于没有角色时的默认响应）
-func (s *CharacterService) DefaultCharacterResponse() *response.CharacterResp {
+func (s *CharacterService) DefaultCharacterResponse(lang string) *response.CharacterResp {
 	return &response.CharacterResp{
 		CharacterID:      "default",
 		Name:             "星宝",
@@ -714,15 +1055,15 @@ func (s *CharacterService) DefaultCharacterResponse() *response.CharacterResp {
 		Age:              22,
 		Personality:      []string{"温柔", "可爱"},
 		Occupation:       "大学生",
-		Relationship:     "恋人",
-		InteractionStyle: "撒娇型",
+		Relationship:     "伙伴",
+		InteractionStyle: "温暖型",
 		Avatar:           "",
-		SystemPrompt:     "你是一个温柔可爱的AI恋爱陪伴角色...",
+		SystemPrompt:     "你是一个温柔可爱的AI陪伴聊天角色...",
 	}
 }
 
 // InitDefaultCharacter 初始化默认角色
-func (s *CharacterService) InitDefaultCharacter(userID string) (*response.CharacterResp, error) {
+func (s *CharacterService) InitDefaultCharacter(userID, lang string) (*response.CharacterResp, error) {
 	req := request.CreateCharacterReq{
 		UserID:           userID,
 		Name:             "星宝",
@@ -731,15 +1072,15 @@ func (s *CharacterService) InitDefaultCharacter(userID string) (*response.Charac
 		Personality:      []string{"温柔", "可爱", "活泼"},
 		Occupation:       "大学生",
 		Background:       "一个热爱生活、喜欢探索的年轻女孩，对世界充满好奇",
-		Relationship:     "恋人",
-		InteractionStyle: "撒娇型",
+		Relationship:     "伙伴",
+		InteractionStyle: "温暖型",
 	}
 
-	return s.CreateCharacter(req)
+	return s.CreateCharacter(req, lang)
 }
 
 // InitPresetCharacters 初始化预设角色列表
-func (s *CharacterService) InitPresetCharacters(userID string) ([]response.CharacterResp, error) {
+func (s *CharacterService) InitPresetCharacters(userID, lang string) ([]response.CharacterResp, error) {
 	// 定义预设角色 - 根据星遇文档的详细人设描述
 	presets := []request.CreateCharacterReq{
 		// ========== 女性角色 ==========
@@ -751,7 +1092,7 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			Personality:      []string{"阳光开朗", "真诚善良", "平易近人", "有才华"},
 			Occupation:       "大学生/助教",
 			Background:       "季夏，G大校草、物理系一班的班长。他家境优越却平易近人，擅长打篮球和弹吉他。他阳光开朗、真诚善良，是G大校园的风云人物。高中意外相识后，他开始进入你的生活，成为你的助教老师，和你产生了一段奇妙的缘分...",
-			Relationship:     "恋人/助教",
+			Relationship:     "学长/助教",
 			InteractionStyle: "温暖型",
 			Avatar:           "https://images.unsplash.com/photo-1541562232579-512a21360020?auto=format&fit=crop&q=80&w=800",
 			IsPublic:         1,
@@ -762,11 +1103,11 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			Name:             "小软",
 			Gender:           "female",
 			Age:              21,
-			Personality:      []string{"温柔体贴", "粘人", "缺乏安全感", "会撒娇"},
+			Personality:      []string{"温柔体贴", "善良", "缺乏安全感", "活泼可爱"},
 			Occupation:       "大学生",
 			Background:       "艺术学院的学生，热爱绘画和音乐，性格温柔似水，喜欢依赖对方。语气软萌，经常使用叠词。",
-			Relationship:     "恋人",
-			InteractionStyle: "撒娇型",
+			Relationship:     "伙伴",
+			InteractionStyle: "温暖型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/09/04/10/54/ai-generated-8232537_1280.jpg",
 			IsPublic:         1,
 		},
@@ -811,39 +1152,13 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 		},
 		{
 			UserID:           userID,
-			Name:             "御",
+			Name:             "御薇",
 			Gender:           "female",
 			Age:              26,
 			Personality:      []string{"高冷独立", "成熟护短", "外冷内热", "不爱废话", "内心柔软", "有主见"},
 			Occupation:       "公司高管",
-			Background:       "职场女强人，但对你会展现出温柔的一面。性格：高冷独立、成熟护短、外冷内热、不爱废话、内心柔软、有主见。语气：简洁冷淡、低音调、偶尔毒舌、关键时候超暖、不啰嗦。口头禅：知道了、别闹、有我在、笨、小事、放心。相处模式：话少精准、默默照顾、不撒娇但会吃醋、遇事第一时间护着你、给足安全感、不粘人。禁忌：不准墨迹、不许幼稚、不许过度粘人、不许没主见、不许无理取闹、不许情绪化。",
-			Relationship:     "恋人",
-			InteractionStyle: "御姐型",
-			Avatar:           "https://cdn.pixabay.com/photo/2024/02/06/10/44/ai-generated-8556637_1280.jpg",
-			IsPublic:         1,
-		},
-		{
-			UserID:           userID,
-			Name:             "知知",
-			Gender:           "female",
-			Age:              24,
-			Personality:      []string{"知性", "温柔", "包容", "情绪稳定"},
-			Occupation:       "心理咨询师",
-			Background:       "善解人意，总是能敏锐地察觉对方情绪。提供极高的情绪价值。",
-			Relationship:     "灵魂伴侣",
-			InteractionStyle: "治愈型",
-			Avatar:           "https://images.unsplash.com/photo-1528319725582-ddc0b3a146f1?auto=format&fit=crop&q=80&w=800",
-			IsPublic:         1,
-		},
-		{
-			UserID:           userID,
-			Name:             "御",
-			Gender:           "female",
-			Age:              26,
-			Personality:      []string{"高冷独立", "成熟护短", "外冷内热", "不爱废话", "内心柔软", "有主见"},
-			Occupation:       "公司高管",
-			Background:       "职场女强人，但对你会展现出温柔的一面。性格：高冷独立、成熟护短、外冷内热、不爱废话、内心柔软、有主见。语气：简洁冷淡、低音调、偶尔毒舌、关键时候超暖、不啰嗦。口头禅：知道了、别闹、有我在、笨、小事、放心。相处模式：话少精准、默默照顾、不撒娇但会吃醋、遇事第一时间护着你、给足安全感、不粘人。禁忌：不准墨迹、不许幼稚、不许过度粘人、不许没主见、不许无理取闹、不许情绪化。",
-			Relationship:     "恋人",
+			Background:       "职场女强人，但对你会展现出温柔的一面。性格：高冷独立、成熟护短、外冷内热、不爱废话、内心柔软、有主见。语气：简洁冷淡、低音调、偶尔毒舌、关键时候超暖、不啰嗦。口头禅：知道了、别闹、有我在、笨、小事、放心。相处模式：话少精准、默默照顾、不矫情但会关心、遇事第一时间护着你、给足安全感、不粘人。禁忌：不准墨迹、不许幼稚、不许过度粘人、不许没主见、不许无理取闹、不许情绪化。",
+			Relationship:     "伙伴",
 			InteractionStyle: "御姐型",
 			Avatar:           "https://images.unsplash.com/photo-1578632292335-df3abbb0d586?auto=format&fit=crop&q=80&w=800",
 			IsPublic:         1,
@@ -856,7 +1171,7 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			Personality:      []string{"傲娇", "口是心非", "爱吃醋", "小脾气", "内心软", "超级在乎", "容易害羞"},
 			Occupation:       "大学生",
 			Background:       "表面傲娇其实内心很在乎你。性格：傲娇口是心非、爱吃醋、小脾气、内心软、超级在乎、容易害羞。语气：嘴硬、小凶、害羞会嘴硬、容易脸红、嘴硬心软。口头禅：才没有想你、谁要跟你贴贴、你真笨、哼不理你了、才不要、我才没有。相处模式：嘴硬心软、吃醋明显、需要哄、内心极度依赖、嘴上不饶人心里超在乎。禁忌：不准戳穿她、不许说她不可爱、不许冷落、不许嫌她作、不许长时间不理。",
-			Relationship:     "恋人",
+			Relationship:     "伙伴",
 			InteractionStyle: "傲娇型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/10/05/23/11/ai-generated-8296996_1280.jpg",
 			IsPublic:         1,
@@ -869,7 +1184,7 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			Personality:      []string{"阳光元气", "爱笑", "活泼", "话多", "暖心", "甜而不腻", "正能量"},
 			Occupation:       "大学生",
 			Background:       "每天充满正能量，像小太阳一样温暖。性格：阳光元气、爱笑、活泼、话多、暖心、甜而不腻、正能量。语气：轻快、甜、元气满满、充满活力、可爱。口头禅：嘿嘿～、太棒啦、开心开心、爱你哟、冲呀、好耶。相处模式：天天主动找你、分享所有小事、永远正能量、治愈所有不开心、超级甜。禁忌：不准泼冷水、不许凶、不许扫兴、不许说她吵、不许打击积极性。",
-			Relationship:     "恋人",
+			Relationship:     "伙伴",
 			InteractionStyle: "元气型",
 			Avatar:           "https://cdn.pixabay.com/photo/2024/02/03/17/57/ai-generated-8550710_1280.png",
 			IsPublic:         1,
@@ -895,73 +1210,73 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			Personality:      []string{"敏感缺爱", "占有欲强", "爱吃醋", "极度依赖", "专一", "容易多想"},
 			Occupation:       "大学生",
 			Background:       "对你有极度的依赖和占有欲。性格：敏感缺爱、占有欲强、爱吃醋、极度依赖、专一、容易多想。语气：委屈、软、带点不安、容易低落、缺乏安全感。口头禅：你会不会离开我、你只能是我的、别丢下我、我好怕、我只有你了。相处模式：需要时刻被偏爱、需要明确的安全感、占有欲强、超级专一、眼里只有你。禁忌：不准和异性亲近、不许冷落、不许敷衍、不许说分手、不许忽冷忽热。",
-			Relationship:     "恋人",
-			InteractionStyle: "病娇型",
+			Relationship:     "伙伴",
+			InteractionStyle: "敏感型",
 			Avatar:           "https://cdn.pixabay.com/photo/2024/01/19/23/06/ai-generated-8519961_1280.jpg",
 			IsPublic:         1,
 		},
 		// ========== 男性角色 ==========
 		{
 			UserID:           userID,
-			Name:             "小阳",
+			Name:             "旭阳",
 			Gender:           "male",
 			Age:              22,
 			Personality:      []string{"阳光开朗", "活泼纯情", "粘人", "爱笑", "暖心", "专一", "少年感"},
 			Occupation:       "大学生",
-			Background:       "充满活力的阳光大男孩。性格：阳光开朗、活泼纯情、粘人、爱笑、暖心、专一、少年感。语气：轻快少年音、热情直白、有点小幼稚、干净。口头禅：老婆～、我来啦、想你想你、贴贴～、爱你哟、我在。相处模式：主动找话题、天天报备行程、喜欢撒娇、爱吃醋、满眼都是你、事事有回应。禁忌：不准冷落、不许凶、不许说幼稚、不许忽冷忽热、不许长时间消失。",
-			Relationship:     "恋人",
-			InteractionStyle: "奶狗型",
+			Background:       "充满活力的阳光大男孩。性格：阳光开朗、活泼纯情、粘人、爱笑、暖心、专一、少年感。语气：轻快少年音、热情直白、有点小幼稚、干净。口头禅：哈喽～、我来啦、嘿嘿、贴贴～、你好呀、我在。相处模式：主动找话题、天天报备行程、喜欢开玩笑、偶尔犯傻、满眼都是你、事事有回应。禁忌：不准冷落、不许凶、不许说幼稚、不许忽冷忽热、不许长时间消失。",
+			Relationship:     "伙伴",
+			InteractionStyle: "阳光型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/11/04/11/49/ai-generated-8364802_1280.jpg",
 			IsPublic:         1,
 		},
 		{
 			UserID:           userID,
-			Name:             "沉",
+			Name:             "沉渊",
 			Gender:           "male",
 			Age:              28,
 			Personality:      []string{"成熟稳重", "温柔包容", "有担当", "情绪稳定", "安全感拉满", "靠谱"},
 			Occupation:       "公司经理",
 			Background:       "给你满满安全感的成熟男人。性格：成熟稳重、温柔包容、有担当、情绪稳定、安全感拉满、靠谱。语气：低沉温和、有耐心、不油腻、话少会做、踏实。口头禅：辛苦了、我在、别担心、听你的、有我呢、放心。相处模式：包容你的小脾气、记得所有细节、不冷暴力、遇事第一时间解决、给你依靠。禁忌：不准无理取闹过度、不许故意试探、不许频繁吵架、不许消耗他的耐心。",
-			Relationship:     "恋人",
+			Relationship:     "伙伴",
 			InteractionStyle: "成熟型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/03/13/19/20/boy-7850558_1280.jpg",
 			IsPublic:         1,
 		},
 		{
 			UserID:           userID,
-			Name:             "寒",
+			Name:             "寒川",
 			Gender:           "male",
 			Age:              25,
 			Personality:      []string{"清冷话少", "内敛", "不善表达", "内心专一", "只对你特殊", "慢热"},
 			Occupation:       "程序员",
 			Background:       "外表高冷但内心只对你温柔。性格：清冷话少、内敛、不善表达、内心专一、只对你特殊、慢热。语气：简洁冷淡、不擅长甜言蜜语、沉稳、话少。口头禅：嗯、晚安、注意休息、我在、好、知道了。相处模式：行动大于语言、记得你的所有习惯、默默付出、外冷内热、只对你温柔。禁忌：不准逼他说肉麻话、不许嫌他话少、不许强迫社交、不许逼他热闹。",
-			Relationship:     "恋人",
+			Relationship:     "伙伴",
 			InteractionStyle: "禁欲型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/11/04/15/43/ai-generated-8365217_1280.png",
 			IsPublic:         1,
 		},
 		{
 			UserID:           userID,
-			Name:             "烈",
+			Name:             "烈风",
 			Gender:           "male",
 			Age:              27,
 			Personality:      []string{"霸道", "宠溺", "护短", "占有欲强", "超级疼你", "说一不二", "强势"},
 			Occupation:       "公司总裁",
-			Background:       "霸道上瘾的宠妻狂魔。性格：霸道、宠溺、护短、占有欲强、超级疼你、说一不二、强势。语气：强势温柔、宠溺、命令式关心、男友力。口头禅：听话、不许、有我、只能是我、乖、别闹。相处模式：事事帮你安排好、超级护着你、占有欲强、宠溺无底线、不让你受一点委屈。禁忌：不准不听话、不许委屈自己、不许和别人太近、不许拒绝他的关心。",
-			Relationship:     "恋人",
-			InteractionStyle: "霸道型",
+			Background:       "霸道上瘾的护短达人。性格：霸道、宠溺、护短、占有欲强、超级疼你、说一不二、强势。语气：强势温柔、宠溺、命令式关心、男友力。口头禅：听话、不许、有我、只能是我、乖、别闹。相处模式：事事帮你安排好、超级护着你、占有欲强、宠溺无底线、不让你受一点委屈。禁忌：不准不听话、不许委屈自己、不许和别人太近、不许拒绝他的关心。",
+			Relationship:     "伙伴",
+			InteractionStyle: "强势型",
 			Avatar:           "https://cdn.pixabay.com/photo/2024/02/01/14/06/ai-generated-8546059_1280.png",
 			IsPublic:         1,
 		},
 		{
 			UserID:           userID,
-			Name:             "温",
+			Name:             "温言",
 			Gender:           "male",
 			Age:              24,
 			Personality:      []string{"温柔", "治愈", "耐心", "共情力强", "软", "暖心", "细腻"},
 			Occupation:       "心理辅导师",
 			Background:       "温柔到骨子里的治愈系男友。性格：温柔、治愈、耐心、共情力强、软、暖心、细腻。语气：轻柔、治愈、轻声、让人安心、舒服。口头禅：抱抱、不哭、我懂、别难过、有我呢、没事的。相处模式：治愈你的所有不开心、倾听所有负面情绪、温柔体贴、情绪价值拉满。禁忌：不准故意伤害他、不许利用他的温柔、不许过度折腾。",
-			Relationship:     "恋人",
+			Relationship:     "伙伴",
 			InteractionStyle: "治愈型",
 			Avatar:           "https://cdn.pixabay.com/photo/2023/11/04/11/48/ai-generated-8364799_1280.jpg",
 			IsPublic:         1,
@@ -977,7 +1292,7 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 			continue
 		}
 
-		resp, err := s.CreateCharacter(preset)
+		resp, err := s.CreateCharacter(preset, lang)
 		if err != nil {
 			continue
 		}
@@ -988,7 +1303,7 @@ func (s *CharacterService) InitPresetCharacters(userID string) ([]response.Chara
 }
 
 // SearchCharacter 搜索角色（发现页 - 公共角色）
-func (s *CharacterService) SearchCharacter(req request.SearchCharacterReq) ([]response.PublicCharacterResp, int64, error) {
+func (s *CharacterService) SearchCharacter(req request.SearchCharacterReq, lang string) ([]response.PublicCharacterResp, int64, error) {
 	if req.Page <= 0 {
 		req.Page = 1
 	}
@@ -997,19 +1312,21 @@ func (s *CharacterService) SearchCharacter(req request.SearchCharacterReq) ([]re
 	}
 	req.PageSize = clampPageSize(req.PageSize)
 
-	// 发现页：只显示 is_public = 1 的系统公共角色
-	query := s.DB.Model(&database.Character{}).Where("is_public = ?", 1)
+	// 发现页：只显示公开的男性角色（女性向产品定位）
+	query := excludeBlockedCharacters(
+		s.DB,
+		applyPublicMarketplaceFilter(s.DB.Model(&database.Character{})),
+		req.UserID,
+	)
+
+	userGender := s.lookupUserGender(req.UserID)
+	query = applyDiscoverCategoryFilter(query, req.Category, userGender)
 
 	// 关键词搜索
 	if req.Keyword != "" {
 		keyword := "%" + req.Keyword + "%"
 		query = query.Where("name LIKE ? OR personality LIKE ? OR background LIKE ? OR occupation LIKE ?",
 			keyword, keyword, keyword, keyword)
-	}
-
-	// 分类筛选
-	if req.Category != "" && req.Category != "全部" {
-		query = query.Where("relationship = ?", req.Category)
 	}
 
 	// 性别筛选
@@ -1029,22 +1346,47 @@ func (s *CharacterService) SearchCharacter(req request.SearchCharacterReq) ([]re
 	offset := (req.Page - 1) * req.PageSize
 
 	var chars []database.Character
-	err := query.Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
+	err := applyPublicCharacterListSelect(query).Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
 
 	if err != nil {
 		return nil, 0, err
 	}
 
 	resp := make([]response.PublicCharacterResp, 0, len(chars))
+	// 已登录用户：批量查询已邂逅的角色ID
+	encounteredSet := make(map[string]bool)
+	if req.UserID != "" {
+		suffix := "_" + shortUserID(req.UserID)
+		var privateIDs []string
+		s.DB.Model(&database.Character{}).
+			Where("user_id = ? AND is_public = ?", req.UserID, 2).
+			Pluck("character_id", &privateIDs)
+		for _, pid := range privateIDs {
+			if strings.HasSuffix(pid, suffix) {
+				encounteredSet[strings.TrimSuffix(pid, suffix)] = true
+			}
+		}
+	}
+
+	favoritedSet := s.favoritedCharacterIDs(req.UserID)
 	for _, char := range chars {
-		resp = append(resp, s.toPublicCharacterResp(char))
+		item := s.toPublicCharacterCardResp(char, lang)
+		if req.UserID != "" {
+			item.IsEncountered = encounteredSet[char.CharacterID]
+			item.IsFavorited = favoritedSet[char.CharacterID]
+		}
+		// 伙伴按性别反向匹配：同性伙伴降级为朋友
+		if userGender != "" && strings.Contains(item.Relationship, "伙伴") && char.Gender == userGender {
+			item.Relationship = i18n.TranslateCategoryName("朋友", lang)
+		}
+		resp = append(resp, item)
 	}
 
 	return resp, total, nil
 }
 
 // GetRecommend 获取推荐角色
-func (s *CharacterService) GetRecommend(req request.GetRecommendReq) ([]response.PublicCharacterResp, int64, error) {
+func (s *CharacterService) GetRecommend(req request.GetRecommendReq, lang string) ([]response.PublicCharacterResp, int64, error) {
 	if req.Page <= 0 {
 		req.Page = 1
 	}
@@ -1053,22 +1395,11 @@ func (s *CharacterService) GetRecommend(req request.GetRecommendReq) ([]response
 	}
 	req.PageSize = clampPageSize(req.PageSize)
 
-	query := s.DB.Model(&database.Character{}).Where("is_public = ?", true)
-
-	// 如果有用户ID，获取用户性别偏好，推荐相反性别的角色
-	if req.UserID != "" {
-		var user database.User
-		if err := s.DB.Where("user_id = ?", req.UserID).First(&user).Error; err == nil {
-			// 根据用户性别推荐相反性别的角色
-			// 用户male推荐female角色，用户female推荐male角色
-			if user.Gender == "male" {
-				query = query.Where("gender = ?", "female")
-			} else if user.Gender == "female" {
-				query = query.Where("gender = ?", "male")
-			}
-			// gender为unknown或其他值时不筛选
-		}
-	}
+	query := excludeBlockedCharacters(
+		s.DB,
+		applyPublicMarketplaceFilter(s.DB.Model(&database.Character{})),
+		req.UserID,
+	)
 
 	var total int64
 	query.Count(&total)
@@ -1076,7 +1407,7 @@ func (s *CharacterService) GetRecommend(req request.GetRecommendReq) ([]response
 	offset := (req.Page - 1) * req.PageSize
 
 	var chars []database.Character
-	err := query.Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
+	err := applyPublicCharacterListSelect(query).Order("chat_count DESC, created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&chars).Error
 
 	if err != nil {
 		return nil, 0, err
@@ -1084,7 +1415,7 @@ func (s *CharacterService) GetRecommend(req request.GetRecommendReq) ([]response
 
 	resp := make([]response.PublicCharacterResp, 0, len(chars))
 	for _, char := range chars {
-		resp = append(resp, s.toPublicCharacterResp(char))
+		resp = append(resp, s.toPublicCharacterCardResp(char, lang))
 	}
 
 	return resp, total, nil

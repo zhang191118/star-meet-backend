@@ -188,6 +188,54 @@ func TestUserRegisterRejectsMissingEmailWithValidationError(t *testing.T) {
 	}
 }
 
+func TestUserRegisterGeneratesNicknameWhenMissing(t *testing.T) {
+	db := setupUserValidationDB(t)
+	router := setupUserValidationRouterWithAPI(&apiv1.UserAPI{
+		UserService: &service.UserService{DB: db},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/user/register", bytes.NewBufferString(`{"email":"generated-nickname@example.com","password":"secret123","gender":"female","age":28}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected registration to succeed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var user database.User
+	if err := db.Where("email = ?", "generated-nickname@example.com").First(&user).Error; err != nil {
+		t.Fatalf("expected registered user to be persisted: %v", err)
+	}
+	if user.Nickname == "" {
+		t.Fatal("expected registration without a nickname to generate one")
+	}
+}
+
+func TestUserRegisterPersistsOptionalProfile(t *testing.T) {
+	db := setupUserValidationDB(t)
+	router := setupUserValidationRouterWithAPI(&apiv1.UserAPI{
+		UserService: &service.UserService{DB: db},
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/user/register", bytes.NewBufferString(`{"email":"profile@example.com","password":"secret123","nickname":"星野","gender":"female","age":28}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected registration with optional profile to succeed, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var user database.User
+	if err := db.Where("email = ?", "profile@example.com").First(&user).Error; err != nil {
+		t.Fatalf("expected registered user to be persisted: %v", err)
+	}
+	if user.Nickname != "星野" || user.Gender != "female" || user.Age != 28 {
+		t.Fatalf("unexpected optional profile fields: %+v", user)
+	}
+}
+
 func TestUserRegisterRejectsDuplicateEmailWithStableErrorCode(t *testing.T) {
 	db := setupUserValidationDB(t)
 	if err := db.Create(&database.User{
@@ -201,9 +249,11 @@ func TestUserRegisterRejectsDuplicateEmailWithStableErrorCode(t *testing.T) {
 		UserService: &service.UserService{DB: db},
 	})
 
-	payload, err := json.Marshal(map[string]string{
+	payload, err := json.Marshal(map[string]interface{}{
 		"email":    "duplicate@example.com",
 		"password": "secret123",
+		"gender":   "female",
+		"age":      28,
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -356,7 +406,7 @@ func TestUserRefreshRejectsTokenForMissingUserWithStableErrorCode(t *testing.T) 
 	router := setupUserValidationRouterWithAPI(&apiv1.UserAPI{
 		UserService: &service.UserService{DB: setupUserValidationDB(t)},
 	})
-	refreshToken, err := utils.GenerateToken("missing-refresh-user")
+	refreshToken, err := utils.GenerateRefreshToken("missing-refresh-user")
 	if err != nil {
 		t.Fatalf("generate refresh token: %v", err)
 	}

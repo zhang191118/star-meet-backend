@@ -30,7 +30,7 @@ func setupAccessControlAPITestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 
-	if err := db.AutoMigrate(&database.User{}, &database.Character{}, &database.Message{}, &database.Favorite{}, &database.Memory{}); err != nil {
+	if err := db.AutoMigrate(&database.User{}, &database.Character{}, &database.Message{}, &database.Favorite{}, &database.Memory{}, &database.Block{}); err != nil {
 		t.Fatalf("migrate tables: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestPublicCharacterDetailDoesNotExposeInternalFields(t *testing.T) {
 		CharacterID:  "public-detail-char",
 		UserID:       "system_admin",
 		Name:         "公开详情角色",
-		Gender:       "female",
+		Gender:       "male",
 		IsPublic:     1,
 		SystemPrompt: "internal prompt",
 		Mem0AgentID:  "mem0-internal-id",

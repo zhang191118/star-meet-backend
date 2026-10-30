@@ -2,6 +2,7 @@
 .idea
 .env
 .env.*
+.moments.env
 config.yaml
 config.local.yaml
 logs

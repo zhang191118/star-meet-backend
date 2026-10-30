@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ func setupCharacterPaginationServiceTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&database.Character{}); err != nil {
+	if err := db.AutoMigrate(&database.Character{}, &database.Block{}); err != nil {
 		t.Fatalf("migrate character table: %v", err)
 	}
 	return db
@@ -34,7 +35,7 @@ func TestPublicCharactersBeforeIDUsesStableSort(t *testing.T) {
 			CharacterID:  fmt.Sprintf("stable-public-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("稳定公开角色 %d", i),
-			Gender:       "female",
+			Gender:       "male",
 			Relationship: "恋人",
 			IsPublic:     1,
 			ChatCount:    100,
@@ -50,7 +51,7 @@ func TestPublicCharactersBeforeIDUsesStableSort(t *testing.T) {
 		BeforeID: "stable-public-char-003",
 		Page:     1,
 		PageSize: 2,
-	})
+	}, "en")
 	if err != nil {
 		t.Fatalf("get public list before cursor: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestMyCharactersUsesStableIDTieBreakerForSameRank(t *testing.T) {
 	}
 
 	service := &CharacterService{DB: db}
-	characters, total, err := service.GetMyCharacters("stable-my-user", 1, 3)
+	characters, total, err := service.GetMyCharacters("stable-my-user", 1, 3, "en")
 	if err != nil {
 		t.Fatalf("get my characters: %v", err)
 	}
@@ -148,7 +149,7 @@ func TestMyCharactersIncludesUserCreatedPrivateCharacters(t *testing.T) {
 	}
 
 	service := &CharacterService{DB: db}
-	characters, total, err := service.GetMyCharacters("my-contract-user", 1, 20)
+	characters, total, err := service.GetMyCharacters("my-contract-user", 1, 20, "en")
 	if err != nil {
 		t.Fatalf("get my characters: %v", err)
 	}
@@ -160,5 +161,54 @@ func TestMyCharactersIncludesUserCreatedPrivateCharacters(t *testing.T) {
 	}
 	if characters[0].CharacterID != "created-private-char" || characters[1].CharacterID != "encounter-private-char" {
 		t.Fatalf("expected user-created and encountered private characters only, got %+v", characters)
+	}
+}
+
+func TestPublicListOmitsLongFormStoryFields(t *testing.T) {
+	db := setupCharacterPaginationServiceTestDB(t)
+	character := database.Character{
+		CharacterID:     "slim-public-char",
+		UserID:          "system_admin",
+		Name:            "瘦身公开角色",
+		Gender:          "male",
+		Relationship:    "恋人",
+		Avatar:          "https://example.com/avatar.png",
+		BannerImage:     "https://example.com/banner.png",
+		IsPublic:        1,
+		ChatCount:       12,
+		Background:      strings.Repeat("背景", 200),
+		SystemPrompt:    strings.Repeat("提示", 200),
+		Narrative:       strings.Repeat("故事", 200),
+		BasicSetting:    strings.Repeat("设定", 200),
+		Example:         strings.Repeat("示例", 80),
+		FirstSituation:  strings.Repeat("开场", 80),
+		FirstWords:      "你好呀",
+		Comment:         "钩子句",
+		TagsJSON:        `["tag"]`,
+		PersonalityTags: "温柔",
+		BgImage:         "https://example.com/bg.png",
+	}
+	if err := db.Create(&character).Error; err != nil {
+		t.Fatalf("create character: %v", err)
+	}
+
+	service := &CharacterService{DB: db}
+	characters, total, err := service.GetPublicList(request.GetPublicCharactersReq{
+		Page:     1,
+		PageSize: 20,
+	}, "zh-Hans")
+	if err != nil {
+		t.Fatalf("get public list: %v", err)
+	}
+	if total != 1 || len(characters) != 1 {
+		t.Fatalf("expected 1 public character, got total=%d list=%+v", total, characters)
+	}
+	item := characters[0]
+	// BgImage 是发现页竖版卡片的底图，属于卡片字段，需随列表返回
+	if item.CharacterID != "slim-public-char" || item.Avatar == "" || item.BannerImage == "" || item.BgImage == "" {
+		t.Fatalf("expected card fields to remain, got %+v", item)
+	}
+	if item.Narrative != "" || item.BasicSetting != "" || item.Example != "" || item.FirstSituation != "" || item.FirstWords != "" || item.Comment != "" || item.TagsJSON != "" || item.PersonalityTags != "" {
+		t.Fatalf("expected story fields to stay on detail endpoint, got %+v", item)
 	}
 }

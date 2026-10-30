@@ -28,6 +28,24 @@ func (Subscription) TableName() string {
 	return "subscriptions"
 }
 
+// AppleTransactionOwner records which account claimed an App Store transaction.
+// It is deliberately separate from subscriptions: legacy subscription rows can
+// contain the same original transaction for several users, so adding a unique
+// index to that table could fail during a production migration.
+type AppleTransactionOwner struct {
+	ID        uint      `json:"id" gorm:"primarykey"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	Environment           string `json:"environment" gorm:"size:20;not null;uniqueIndex:uk_apple_transaction_owner,priority:1"`
+	OriginalTransactionID string `json:"original_transaction_id" gorm:"size:255;not null;uniqueIndex:uk_apple_transaction_owner,priority:2"`
+	UserID                string `json:"user_id" gorm:"size:64;not null;index"`
+}
+
+func (AppleTransactionOwner) TableName() string {
+	return "apple_transaction_owners"
+}
+
 type Plan struct {
 	ID        uint       `json:"id" gorm:"primarykey"`
 	CreatedAt time.Time  `json:"created_at"`

@@ -30,6 +30,13 @@ email:
   from_name: "星遇 StarMeet"
   from_email: "your_email@163.com"
 
+apns:
+  key_id: "your_apple_key_id"
+  team_id: "your_apple_team_id"
+  topic: "com.yourcompany.starmeet"
+  environment: "production"
+  private_key_path: "./secrets/AuthKey_XXXXXXXXXX.p8"
+
 aliyun:
   qwen:
     api_key: "your-dashscope-api-key"
@@ -56,10 +63,16 @@ gemini:
   model: "gemini-2.0-flash"
 
 qdrant:
-  host: "http://localhost:6333"
+  # 留空表示未部署 Qdrant：向量记忆禁用，删号外部清理自动跳过。
+  # 部署了 Qdrant 时填地址（如 http://qdrant:6333）或设置 QDRANT_HOST 环境变量。
+  host: ""
 
 oss:
   endpoint: "oss-cn-hangzhou.aliyuncs.com"
   access_key_id: "your_oss_access_key_id"
   access_key_secret: "your_oss_access_key_secret"
   bucket_name: "your_bucket_name"
+
+# Optional vector-memory embedding provider, independent of the chat model.
+embedding:
+  api_key: "your_zhipu_embedding_api_key"

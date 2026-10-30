@@ -19,9 +19,11 @@ type Character struct {
 	Occupation   string `json:"occupation" gorm:"size:50" json:"occupation"`
 	Background   string `json:"background" gorm:"type:text" json:"background"`
 	VoiceID      string `json:"voice_id" gorm:"size:32" json:"voice_id"`
-	Relationship string `json:"relationship" gorm:"size:20;default:恋人;index:idx_characters_public_relationship_rank,priority:2" json:"relationship"`
-	Style        string `json:"style" gorm:"size:20;default:撒娇型" json:"style"`
+	Relationship string `json:"relationship" gorm:"size:20;default:伙伴;index:idx_characters_public_relationship_rank,priority:2" json:"relationship"`
+	Style        string `json:"style" gorm:"size:20;default:温暖型" json:"style"`
 	Avatar       string `json:"avatar" gorm:"size:255" json:"avatar"`
+	BgImage      string `json:"bg_image" gorm:"size:255"`     // 用户自定义聊天背景（OSS URL）
+	BannerImage  string `json:"banner_image" gorm:"size:255"` // 发现页推荐卡片横幅图（OSS URL）
 
 	// 系统Prompt（创建时生成，锁定后不变）
 	SystemPrompt string `json:"system_prompt" gorm:"type:text" json:"system_prompt"`
@@ -51,6 +53,27 @@ type Character struct {
 	Birthday        string `json:"birthday" gorm:"size:20"`
 	Constellation   string `json:"constellation" gorm:"size:20"`
 	PersonalityTags string `json:"personality_tags" gorm:"type:text"`
+
+	// ===== Crushie 式角色卡扩展字段 (P0) =====
+	// Comment: 角色卡片钩子句，60-70字反差感独白
+	Comment string `json:"comment" gorm:"type:text"`
+	// Narrative: 故事梗概，300-500字第二人称恋爱线主轴
+	Narrative string `json:"narrative" gorm:"type:text"`
+	// BasicSetting: 人设履历，500字（教育/事业/家庭/性格成因）
+	BasicSetting string `json:"basic_setting" gorm:"type:text"`
+	// Example: 说话风格规范，分号分隔10条 — AI对话一致性核心
+	Example string `json:"example" gorm:"type:text"`
+	// FirstSituation: 开场场景，350字第二人称
+	FirstSituation string `json:"first_situation" gorm:"type:text"`
+	// FirstWords: 角色第一句话（含请求或冲突）
+	FirstWords string `json:"first_words" gorm:"type:text"`
+	// CharacterType: 0=官方角色, 2=UGC用户创建
+	CharacterType int `json:"character_type" gorm:"default:0;index"`
+	// TagsJSON: 四组标签JSON (Roles/Personality/Story/Origin)
+	TagsJSON string `json:"tags_json" gorm:"type:text"`
+	// LocalizedProfile stores region-aware public profile content keyed by
+	// language (en, zh-Hant, zh-Hans). It intentionally excludes chat prompts.
+	LocalizedProfile string `json:"localized_profile" gorm:"type:text"`
 }
 
 func (Character) TableName() string {

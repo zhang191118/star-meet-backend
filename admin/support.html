@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>StarMeet｜支援與意見回饋</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#33243d;background:#faf5fb}*{box-sizing:border-box}body{margin:0}main{max-width:720px;margin:0 auto;padding:36px 20px 64px}h1{font-size:30px;margin-bottom:12px}p{line-height:1.75}.card{background:#fff;border:1px solid #eaddf0;border-radius:20px;padding:24px;margin:24px 0}label{display:block;font-weight:600;margin:18px 0 8px}input,select,textarea,button{font:inherit;width:100%;border:1px solid #d8c7df;border-radius:12px;padding:12px;background:#fff;color:inherit}textarea{resize:vertical;min-height:140px}button{background:#8550aa;color:#fff;border:0;cursor:pointer;font-weight:600;margin-top:20px}button:disabled{opacity:.55;cursor:wait}a{color:#754097}small,.hint{color:#705f79;font-size:14px}#result{white-space:pre-wrap;overflow-wrap:anywhere}#result:empty{display:none}details{margin:18px 0}summary{cursor:pointer;font-weight:600}nav{display:flex;gap:20px;flex-wrap:wrap}input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{outline:3px solid #b691d2;outline-offset:2px}@media(prefers-color-scheme:dark){:root{color:#f2eaf6;background:#1b1521}.card,input,select,textarea{background:#251d2e;border-color:#4e3c5c}.hint,small{color:#c5b5d0}a{color:#dab8f2}}
+</style></head><body><main><nav><a href="/">StarMeet 星伴</a><a href="https://apps.apple.com/app/id6799663680">App Store</a><a href="/privacy">隱私政策</a></nav>
+<h1>支援與意見回饋</h1><p>聊天不自然、記錯了，或遇到功能問題，都可以告訴我們。送出後請保留回饋編號，方便後續聯絡。</p>
+<section class="card"><h2>告訴我們發生了什麼</h2><form id="feedback-form">
+<label for="category">問題類別</label><select id="category" name="category"><option value="chat">角色回覆</option><option value="memory">角色記憶</option><option value="bug">功能或付款問題</option><option value="other">其他建議</option></select>
+<label for="content">問題或建議</label><textarea id="content" name="content" required minlength="5" maxlength="2000" placeholder="請描述操作步驟、預期結果與實際情況。請勿填寫密碼或付款資料。"></textarea>
+<label for="contact">聯絡方式（選填）</label><input id="contact" name="contact" type="text" maxlength="200" autocomplete="email" placeholder="如果希望收到回覆，可以留下電子郵件">
+<p class="hint">內容及選填聯絡方式僅用於處理這次回饋。表單不會自動附上你的聊天紀錄。</p><button id="submit" type="submit">送出回饋</button><p id="result" role="status" aria-live="polite"></p></form></section>
+<section class="card"><h2>常見問題</h2>
+<details><summary>免費額度怎麼計算？</summary><p>一般免費方案每天可傳送 20 則使用者訊息，AI 回覆不計入；額度於台北時間午夜重置。實際可用額度以 App 內提示為準。</p></details>
+<details><summary>會員與續訂</summary><p>目前提供週度與月度方案。請在 App 內查看 Apple 顯示的本地價格、免費試用資格（如有）和續訂條件。可在 iPhone「設定 → Apple 帳號 → 訂閱」管理或取消。刪除 App 或帳號不會自動取消 Apple 訂閱。</p></details>
+<details><summary>角色記錯了怎麼辦？</summary><p>在角色聊天中開啟記憶頁，管理你希望保留的小事。修改或刪除長期記憶不會同時清除原有聊天歷史；如需重新開始，可另外清空聊天記錄。</p></details>
+<details><summary>如何允許或停止主動聯絡？</summary><p>在 App 的通知與陪伴設定中，選擇是否允許角色聯絡、安靜時段和通知顯示內容。拒絕通知仍可正常聊天。</p></details>
+<details><summary>如何刪除帳號？</summary><p>在 App「設定 → 刪除帳號」依畫面確認。聊天、記憶等帳號資料會按刪除流程處理；Apple 訂閱需另外管理。</p></details>
+<details><summary>這是真人交友服務嗎？</summary><p>StarMeet 提供虛構 AI 角色，內容由 AI 生成，僅供年滿 18 歲的使用者作娛樂陪伴。</p></details>
+<p>也可以寄信至 <a href="mailto:support@gofastdating.com">support@gofastdating.com</a>。我們會依問題內容安排處理；請附回饋編號，勿寄送密碼或完整付款資料。</p>
+<p lang="en">For support, use this form or email support@gofastdating.com. Your message and optional contact details are used to handle your request. No chat history is attached automatically.</p></section>
+</main><script>
+const form=document.getElementById('feedback-form'),button=document.getElementById('submit'),result=document.getElementById('result');
+form.addEventListener('submit',async event=>{event.preventDefault();if(!form.reportValidity())return;button.disabled=true;result.textContent='正在送出…';try{
+ const response=await fetch('/api/v1/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category:form.category.value,content:form.content.value.trim(),contact:form.contact.value.trim(),platform:'web',device:'web'})});
+ const data=await response.json();if(!response.ok||data.code!==200||!data.data?.feedback_id)throw new Error('submit_failed');
+ result.textContent='已收到，回饋編號：'+data.data.feedback_id+'。請保留編號，方便後續聯絡。';form.content.value='';form.contact.value='';
+ }catch(error){result.textContent='暫時無法送出，內容已保留。請稍後重試，或寄信至 support@gofastdating.com。';}finally{button.disabled=false;}});
+</script></body></html>

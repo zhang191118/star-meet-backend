@@ -2,8 +2,10 @@
 .env.*
 !.env.example
 !.env.production.example
+.moments.env
 config.yaml
 config.local.yaml
+secrets/
 logs/
 *.log
 *.db
@@ -14,3 +16,11 @@ star-meet-server
 star-meet-server-new
 .idea/
 vendor/
+scripts/generated/
+scripts/avatars_new/
+scripts/avatars_legacy_v2/
+scripts/avatars_refresh_backup_*/
+scripts/banners/
+__pycache__/
+.DS_Store
+tmp/

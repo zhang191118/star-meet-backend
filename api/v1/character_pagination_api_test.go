@@ -24,7 +24,7 @@ func setupCharacterPaginationAPITestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&database.User{}, &database.Character{}, &database.Favorite{}); err != nil {
+	if err := db.AutoMigrate(&database.User{}, &database.Character{}, &database.Favorite{}, &database.Block{}); err != nil {
 		t.Fatalf("migrate character table: %v", err)
 	}
 	return db
@@ -82,7 +82,7 @@ func TestEncounterReturnsConflictForAlreadyEncounteredCharacter(t *testing.T) {
 		CharacterID:  "encounter-dupe-char",
 		UserID:       "system_admin",
 		Name:         "公开角色",
-		Gender:       "female",
+		Gender:       "male",
 		Relationship: "朋友",
 		IsPublic:     1,
 	}).Error; err != nil {
@@ -142,8 +142,8 @@ func TestGetPublicCharactersSupportsBeforeIDCursor(t *testing.T) {
 			CharacterID:  fmt.Sprintf("public-cursor-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("公开游标角色 %d", i),
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 			ChatCount:    100 - i,
 			CreatedAt:    now.Add(time.Duration(i) * time.Second),
@@ -212,8 +212,8 @@ func TestSearchCharactersIncludesMobilePaginationMetadata(t *testing.T) {
 			CharacterID:  fmt.Sprintf("search-meta-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("分页搜索角色 %d", i),
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 			ChatCount:    30 - i,
 		}
@@ -271,8 +271,8 @@ func TestSearchCharactersUsesStableTieBreakerOrdering(t *testing.T) {
 			CharacterID:  fmt.Sprintf("search-stable-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("稳定搜索角色 %d", i),
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 			ChatCount:    99,
 			CreatedAt:    baseTime.Add(time.Duration(i) * time.Second),
@@ -323,8 +323,8 @@ func TestRecommendCharactersIncludesMobilePaginationMetadata(t *testing.T) {
 			CharacterID:  fmt.Sprintf("recommend-meta-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("推荐分页角色 %d", i),
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 			ChatCount:    50 - i,
 		}
@@ -382,8 +382,8 @@ func TestRecommendCharactersUsesStableTieBreakerOrdering(t *testing.T) {
 			CharacterID:  fmt.Sprintf("recommend-stable-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("稳定推荐角色 %d", i),
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 			ChatCount:    88,
 			CreatedAt:    baseTime.Add(time.Duration(i) * time.Second),

@@ -14,6 +14,7 @@ type SendMessageResp struct {
 	ReplyVoiceURL string `json:"reply_voice_url,omitempty"` // 语音回复URL
 	UserEmotion   string `json:"user_emotion"`
 	ReplyEmotion  string `json:"reply_emotion"`
+	DirectorNote  string `json:"director_note,omitempty"`
 	CreatedAt     int64  `json:"created_at"`
 }
 
@@ -26,7 +27,13 @@ type MessageResp struct {
 	VoiceURL      string  `json:"voice_url,omitempty"`
 	VoiceDuration float64 `json:"voice_duration,omitempty"`
 	UserEmotion   string  `json:"user_emotion,omitempty"`
+	DirectorNote  string  `json:"director_note,omitempty"`
 	CreatedAt     int64   `json:"created_at"`
+	IsRecalled    bool    `json:"is_recalled,omitempty"`
+	// 被引用消息的快照，客户端据此渲染引用块，无需二次请求
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	QuotedRole      string `json:"quoted_role,omitempty"`
+	QuotedContent   string `json:"quoted_content,omitempty"`
 }
 
 // 会话详情
@@ -45,6 +52,7 @@ type CharacterBasic struct {
 	Name         string `json:"name"`
 	Avatar       string `json:"avatar"`
 	Relationship string `json:"relationship"`
+	BgImage      string `json:"bg_image,omitempty"`
 }
 
 // 通用响应

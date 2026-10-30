@@ -3,11 +3,14 @@ package v1_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	apiv1 "star-meet-backend/api/v1"
+	openai_compat "star-meet-backend/core/openai_compat"
 	"star-meet-backend/middleware"
 	"star-meet-backend/model/database"
 	"star-meet-backend/service"
@@ -16,6 +19,29 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
+
+type chatAPIRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f chatAPIRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func configuredChatTestAIClient() *openai_compat.Client {
+	client := openai_compat.NewClient("https://model.example.test", "test-api-key", "test-model")
+	client.Client = &http.Client{
+		Transport: chatAPIRoundTripper(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"choices":[{"message":{"role":"assistant","content":"真实模型测试回复"}}]}`,
+				)),
+				Request: req,
+			}, nil
+		}),
+	}
+	return client
+}
 
 func setupChatMessageIdempotencyAPITestDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -32,6 +58,7 @@ func setupChatMessageIdempotencyAPITestDB(t *testing.T) *gorm.DB {
 		&database.Session{},
 		&database.Message{},
 		&database.Memory{},
+		&database.Block{},
 	); err != nil {
 		t.Fatalf("migrate chat idempotency tables: %v", err)
 	}
@@ -113,13 +140,13 @@ func TestSendMessageReusesClientMessageIDsOnRetry(t *testing.T) {
 		UserID:       "system_admin",
 		Name:         "重试角色",
 		Gender:       "female",
-		Relationship: "恋人",
+		Relationship: "伙伴",
 		IsPublic:     1,
 	}).Error; err != nil {
 		t.Fatalf("create character: %v", err)
 	}
 
-	chatAPI := apiv1.NewChatAPI(&service.ChatService{DB: db})
+	chatAPI := apiv1.NewChatAPI(&service.ChatService{DB: db, OpenAICompatClient: configuredChatTestAIClient()})
 	router := gin.New()
 	group := router.Group("/api/v1/chat")
 	group.Use(middleware.Auth())
@@ -226,6 +253,61 @@ func TestSendMessageRejectsUnavailableCharacterWithoutWritingChatData(t *testing
 		if count != 0 {
 			t.Fatalf("expected missing character request not to create %s, got %d", table.name, count)
 		}
+	}
+}
+
+func TestSendMessageReportsAIUnavailableWithoutWritingTemplateReply(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := setupChatMessageIdempotencyAPITestDB(t)
+	if err := db.Create(&database.User{UserID: "chat-ai-unavailable-user", Nickname: "模型不可用用户"}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := db.Create(&database.Character{
+		CharacterID:  "chat-ai-unavailable-char",
+		UserID:       "system_admin",
+		Name:         "模型不可用角色",
+		Gender:       "female",
+		Relationship: "伙伴",
+		IsPublic:     1,
+	}).Error; err != nil {
+		t.Fatalf("create character: %v", err)
+	}
+
+	chatAPI := apiv1.NewChatAPI(&service.ChatService{DB: db})
+	router := gin.New()
+	router.Use(middleware.RequestID())
+	group := router.Group("/api/v1/chat")
+	group.Use(middleware.Auth())
+	group.POST("/message", chatAPI.SendMessage)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/message", bytes.NewReader([]byte(
+		`{"character_id":"chat-ai-unavailable-char","message":"你好","user_message_id":"ai-unavailable-user-msg","reply_message_id":"ai-unavailable-reply-msg"}`,
+	)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+makeTestToken(t, "chat-ai-unavailable-user"))
+	req.Header.Set("X-Request-ID", "chat-ai-unavailable-request")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 for unavailable AI, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	resp := decodeResponse(t, recorder)
+	if resp.ErrorCode != "ai_service_unavailable" {
+		t.Fatalf("expected ai_service_unavailable error_code, got %q", resp.ErrorCode)
+	}
+	if resp.RequestID != "chat-ai-unavailable-request" {
+		t.Fatalf("expected request id in response, got %q", resp.RequestID)
+	}
+
+	var assistantCount int64
+	if err := db.Model(&database.Message{}).Where("role = ?", "assistant").Count(&assistantCount).Error; err != nil {
+		t.Fatalf("count assistant replies: %v", err)
+	}
+	if assistantCount != 0 {
+		t.Fatalf("expected no assistant template reply, got %d messages", assistantCount)
 	}
 }
 
@@ -393,7 +475,8 @@ func TestStreamMessageRejectsMissingRequiredFieldsWithValidationError(t *testing
 	}
 }
 
-func TestMarkMessageReadRejectsMissingMessageIDWithValidationError(t *testing.T) {
+// 新契约：message_id 可选（缺失时只清零会话未读），character_id 仍为必填。
+func TestMarkMessageReadValidationAndSessionReadContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	db := setupChatMessageIdempotencyAPITestDB(t)
@@ -408,39 +491,49 @@ func TestMarkMessageReadRejectsMissingMessageIDWithValidationError(t *testing.T)
 	group.Use(middleware.Auth())
 	group.POST("/message/read", chatAPI.MarkMessageRead)
 
-	payload := []byte(`{"character_id":"chat-read-char"}`)
+	// 1) 缺少 character_id → 422 校验失败
+	payload := []byte(`{"message_id":"some-message"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/message/read", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+makeTestToken(t, "chat-read-user"))
-	req.Header.Set("X-Request-ID", "chat-read-missing-message-req")
+	req.Header.Set("X-Request-ID", "chat-read-missing-char-req")
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
 
 	if recorder.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected status 422 for missing message_id, got %d body=%s", recorder.Code, recorder.Body.String())
+		t.Fatalf("expected status 422 for missing character_id, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
-
 	resp := decodeResponse(t, recorder)
 	if resp.ErrorCode != "validation_failed" {
 		t.Fatalf("expected validation_failed error_code, got %q", resp.ErrorCode)
-	}
-	if resp.RequestID != "chat-read-missing-message-req" {
-		t.Fatalf("expected request id in response, got %q", resp.RequestID)
 	}
 	details, ok := resp.Details.(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected details object, got %#v", resp.Details)
 	}
-	if details["field"] != "message_id" {
-		t.Fatalf("expected message_id field detail, got %#v", details["field"])
+	if details["field"] != "character_id" {
+		t.Fatalf("expected character_id field detail, got %#v", details["field"])
 	}
-	if _, ok := details["reason"].(string); !ok {
-		t.Fatalf("expected reason detail, got %#v", details["reason"])
+
+	// 2) 仅带 character_id（无 message_id）→ 200，只清零会话未读
+	sessionPayload := []byte(`{"character_id":"chat-read-char"}`)
+	sessionReq := httptest.NewRequest(http.MethodPost, "/api/v1/chat/message/read", bytes.NewReader(sessionPayload))
+	sessionReq.Header.Set("Content-Type", "application/json")
+	sessionReq.Header.Set("Authorization", "Bearer "+makeTestToken(t, "chat-read-user"))
+	sessionReq.Header.Set("X-Request-ID", "chat-read-session-only-req")
+
+	sessionRecorder := httptest.NewRecorder()
+	router.ServeHTTP(sessionRecorder, sessionReq)
+
+	if sessionRecorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for session-only read, got %d body=%s", sessionRecorder.Code, sessionRecorder.Body.String())
 	}
 }
 
-func TestMarkMessageReadReturnsStableNotFoundForMissingMessage(t *testing.T) {
+// 消息不存在（本地消息、已撤回等）不阻断会话未读清零：清零目标是会话，
+// 消息标记只是附带动作，因此返回 200 而非 404。
+func TestMarkMessageReadStillClearsSessionWhenMessageMissing(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	db := setupChatMessageIdempotencyAPITestDB(t)
@@ -464,23 +557,13 @@ func TestMarkMessageReadReturnsStableNotFoundForMissingMessage(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("expected status 404 for missing message, got %d body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected status 200 when message missing (session still cleared), got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 
 	resp := decodeResponse(t, recorder)
-	if resp.ErrorCode != "message_not_found" {
-		t.Fatalf("expected message_not_found error_code, got %q", resp.ErrorCode)
-	}
 	if resp.RequestID != "chat-read-message-not-found-req" {
 		t.Fatalf("expected request id in response, got %q", resp.RequestID)
-	}
-	details, ok := resp.Details.(map[string]interface{})
-	if !ok {
-		t.Fatalf("expected details object, got %#v", resp.Details)
-	}
-	if details["field"] != "message_id" {
-		t.Fatalf("expected message_id field detail, got %#v", details["field"])
 	}
 }
 
@@ -591,7 +674,7 @@ func TestUpdateSessionRequiresAtLeastOneMutableField(t *testing.T) {
 		UserID:       "system_admin",
 		Name:         "会话更新角色",
 		Gender:       "female",
-		Relationship: "恋人",
+		Relationship: "伙伴",
 		IsPublic:     1,
 	}).Error; err != nil {
 		t.Fatalf("create character: %v", err)
@@ -990,5 +1073,51 @@ func TestChatCharacterQueryActionsReturnStableNotFoundForMissingSession(t *testi
 				t.Fatalf("expected session_id field detail, got %#v", details["field"])
 			}
 		})
+	}
+}
+
+func TestPrepareRegenerateDeletesOnlyAssistantMessages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := setupChatMessageIdempotencyAPITestDB(t)
+	if err := db.Create(&database.User{UserID: "chat-regen-user", Nickname: "重新生成用户"}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := db.Create(&database.Message{MessageID: "chat-regen-assistant", Role: "assistant", Content: "old reply", UserID: "chat-regen-user", CharacterID: "chat-regen-char"}).Error; err != nil {
+		t.Fatalf("create assistant message: %v", err)
+	}
+	if err := db.Create(&database.Message{MessageID: "chat-regen-user-msg", Role: "user", Content: "hello", UserID: "chat-regen-user", CharacterID: "chat-regen-char"}).Error; err != nil {
+		t.Fatalf("create user message: %v", err)
+	}
+
+	chatAPI := apiv1.NewChatAPI(&service.ChatService{DB: db})
+	router := gin.New()
+	group := router.Group("/api/v1/chat")
+	group.Use(middleware.Auth())
+	group.POST("/message/:message_id/regenerate", chatAPI.PrepareRegenerate)
+
+	post := func(messageID string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/message/"+messageID+"/regenerate", nil)
+		req.Header.Set("Authorization", "Bearer "+makeTestToken(t, "chat-regen-user"))
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	if rec := post("chat-regen-assistant"); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 deleting assistant message, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var count int64
+	db.Model(&database.Message{}).Where("message_id = ?", "chat-regen-assistant").Count(&count)
+	if count != 0 {
+		t.Fatalf("expected assistant message to be soft-deleted, scoped count=%d", count)
+	}
+
+	if rec := post("chat-regen-user-msg"); rec.Code == http.StatusOK {
+		t.Fatalf("expected user message deletion to be rejected")
+	}
+	db.Model(&database.Message{}).Where("message_id = ?", "chat-regen-user-msg").Count(&count)
+	if count != 1 {
+		t.Fatalf("expected user message to remain, scoped count=%d", count)
 	}
 }

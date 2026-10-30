@@ -4,15 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"star-meet-backend/core/oss"
-	"star-meet-backend/model/database"
 	"star-meet-backend/model/request"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
+	"star-meet-backend/pkg/utils"
 	"star-meet-backend/service"
 
 	"github.com/gin-gonic/gin"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +21,8 @@ import (
 )
 
 type CharacterAPI struct {
-	CharacterService *service.CharacterService
+	CharacterService       *service.CharacterService
+	CharacterConfigService *service.CharacterConfigService
 }
 
 func NewCharacterAPI(charService *service.CharacterService) *CharacterAPI {
@@ -51,7 +52,7 @@ func (a *CharacterAPI) Create(c *gin.Context) {
 
 	req.UserID = userID.(string)
 
-	result, err := a.CharacterService.CreateCharacter(req)
+	result, err := a.CharacterService.CreateCharacter(req, i18n.NormalizeLang(resolveLang(c)))
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -82,58 +83,110 @@ func (a *CharacterAPI) UploadImage(c *gin.Context) {
 		return
 	}
 
-	src, err := file.Open()
+	buffer, ext, contentType, err := readImageUpload(file)
 	if err != nil {
-		response.FailWithMessage(c, "文件打开失败")
+		response.FailWithError(c, http.StatusUnprocessableEntity, imageSizeError(), "invalid_image", nil)
 		return
-	}
-	defer src.Close()
-
-	buffer, err := io.ReadAll(src)
-	if err != nil {
-		response.FailWithMessage(c, "文件读取失败")
-		return
-	}
-
-	ext := "jpg"
-	filename := strings.ToLower(file.Filename)
-	for _, candidate := range []string{".jpg", ".jpeg", ".png", ".gif", ".webp"} {
-		if strings.HasSuffix(filename, candidate) {
-			ext = strings.TrimPrefix(candidate, ".")
-			break
-		}
 	}
 
 	objectName := fmt.Sprintf("characters/%s_%d.%s", userIDStr, time.Now().UnixNano(), ext)
-	contentType := "image/" + ext
-	if ext == "jpg" {
-		contentType = "image/jpeg"
-	}
-
-	imageURL := "/uploads/character/" + filepath.Base(objectName)
-
 	ossClient, err := oss.NewOSSClient()
-	if err == nil {
-		if url, uploadErr := ossClient.Upload(objectName, buffer, contentType); uploadErr == nil {
-			imageURL = url
-		}
+	if err != nil {
+		response.FailWithError(c, http.StatusInternalServerError, "OSS配置不完整，无法上传图片", "oss_not_configured", err)
+		return
 	}
 
-	if strings.HasPrefix(imageURL, "/") {
-		localDir := "./uploads/character"
-		if err := os.MkdirAll(localDir, 0755); err != nil {
-			response.FailWithMessage(c, "创建上传目录失败")
-			return
-		}
-		localPath := filepath.Join(localDir, filepath.Base(objectName))
-		if err := os.WriteFile(localPath, buffer, 0644); err != nil {
-			response.FailWithMessage(c, "保存图片失败")
-			return
-		}
+	url, uploadErr := ossClient.Upload(objectName, buffer, contentType)
+	if uploadErr != nil {
+		response.FailWithError(c, http.StatusInternalServerError, "图片上传到OSS失败", "oss_upload_failed", uploadErr)
+		return
 	}
 
 	response.OkWithData(c, gin.H{
-		"url": imageURL,
+		"url": url,
+	})
+}
+
+// ImportImage 导入远程图片到OSS
+// @Summary 导入远程图片到OSS
+// @Tags 角色模块
+// @Accept json
+// @Produce json
+// @Param url formData string true "远程图片URL"
+// @Success 200 {object} response.Response
+// @Router /api/v1/character/import-image [post]
+func (a *CharacterAPI) ImportImage(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	if userID == nil {
+		failUnauthenticated(c)
+		return
+	}
+	userIDStr := userID.(string)
+
+	var req struct {
+		URL string `json:"url" form:"url" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(c, "请提供有效的图片URL")
+		return
+	}
+
+	imageURL := strings.TrimSpace(req.URL)
+	if imageURL == "" {
+		response.FailWithMessage(c, "图片URL不能为空")
+		return
+	}
+
+	if _, err := publicImageURL(imageURL); err != nil {
+		response.FailWithError(c, http.StatusUnprocessableEntity, "仅支持公网 HTTPS 图片地址", "invalid_image_url", nil)
+		return
+	}
+
+	// 下载远程图片
+	httpClient := safeImageHTTPClient()
+	resp, err := httpClient.Get(imageURL)
+	if err != nil {
+		response.FailWithError(c, http.StatusBadGateway, "下载远程图片失败", "remote_image_download_failed", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		response.FailWithError(c, http.StatusBadGateway, fmt.Sprintf("远程图片返回状态码: %d", resp.StatusCode), "remote_image_unavailable", nil)
+		return
+	}
+
+	buffer, err := io.ReadAll(io.LimitReader(resp.Body, maxImageUploadBytes+1))
+	if err != nil {
+		response.FailWithError(c, http.StatusInternalServerError, "读取远程图片数据失败", "remote_image_read_failed", err)
+		return
+	}
+	if int64(len(buffer)) > maxImageUploadBytes {
+		response.FailWithError(c, http.StatusUnprocessableEntity, imageSizeError(), "invalid_image", nil)
+		return
+	}
+	_, ext, contentType, err := validateImageBytes(buffer)
+	if err != nil {
+		response.FailWithError(c, http.StatusUnprocessableEntity, imageSizeError(), "invalid_image", nil)
+		return
+	}
+
+	objectName := fmt.Sprintf("characters/%s_%d.%s", userIDStr, time.Now().UnixNano(), ext)
+
+	ossClient, err := oss.NewOSSClient()
+	if err != nil {
+		response.FailWithError(c, http.StatusInternalServerError, "OSS配置不完整，无法导入图片", "oss_not_configured", err)
+		return
+	}
+
+	ossURL, uploadErr := ossClient.Upload(objectName, buffer, contentType)
+	if uploadErr != nil {
+		response.FailWithError(c, http.StatusInternalServerError, "图片上传到OSS失败", "oss_upload_failed", uploadErr)
+		return
+	}
+
+	response.OkWithData(c, gin.H{
+		"url": ossURL,
 	})
 }
 
@@ -148,8 +201,13 @@ func (a *CharacterAPI) UploadImage(c *gin.Context) {
 func (a *CharacterAPI) GetDetail(c *gin.Context) {
 	characterID := c.Param("character_id")
 
-	result, err := a.CharacterService.GetCharacterDetail(characterID)
+	lang := resolveProfileLang(c)
+	result, err := a.CharacterService.GetCharacterDetail(optionalAccessUserID(c), characterID, lang)
 	if err != nil {
+		if errors.Is(err, service.ErrCharacterBlocked) {
+			response.FailWithError(c, http.StatusForbidden, "character blocked", "character_blocked", nil)
+			return
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			response.Fail(c, 404, "角色不存在")
 			return
@@ -184,7 +242,8 @@ func (a *CharacterAPI) GetList(c *gin.Context) {
 	req.UserID = userID.(string)
 	req.Page, req.PageSize = normalizePagination(req.Page, req.PageSize, 20)
 
-	result, total, err := a.CharacterService.GetCharacterList(req)
+	lang := resolveProfileLang(c)
+	result, total, err := a.CharacterService.GetCharacterList(req, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -218,7 +277,10 @@ func (a *CharacterAPI) GetPublicList(c *gin.Context) {
 	}
 	req.Page, req.PageSize = normalizePagination(req.Page, req.PageSize, 20)
 
-	result, total, err := a.CharacterService.GetPublicList(req)
+	req.UserID = optionalAccessUserID(c)
+
+	lang := resolveProfileLang(c)
+	result, total, err := a.CharacterService.GetPublicList(req, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -262,7 +324,8 @@ func (a *CharacterAPI) GetMyCharacters(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	page, pageSize = normalizePagination(page, pageSize, 20)
 
-	result, total, err := a.CharacterService.GetMyCharacters(userID.(string), page, pageSize)
+	lang := resolveProfileLang(c)
+	result, total, err := a.CharacterService.GetMyCharacters(userID.(string), page, pageSize, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -298,8 +361,12 @@ func (a *CharacterAPI) Encounter(c *gin.Context) {
 		return
 	}
 
-	err := a.CharacterService.EncounterCharacter(userID.(string), characterID)
+	err := a.CharacterService.EncounterCharacter(userID.(string), characterID, i18n.NormalizeLang(resolveLang(c)))
 	if err != nil {
+		if errors.Is(err, service.ErrCharacterBlocked) {
+			response.FailWithError(c, http.StatusForbidden, "character blocked", "character_blocked", nil)
+			return
+		}
 		if errors.Is(err, service.ErrCharacterUnavailable) {
 			response.FailWithError(c, 404, "character unavailable", "character_unavailable", gin.H{
 				"field":  "character_id",
@@ -461,7 +528,8 @@ func (a *CharacterAPI) InitDefault(c *gin.Context) {
 		return
 	}
 
-	result, err := a.CharacterService.InitDefaultCharacter(userID.(string))
+	lang := i18n.NormalizeLang(resolveLang(c))
+	result, err := a.CharacterService.InitDefaultCharacter(userID.(string), lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -478,7 +546,8 @@ func (a *CharacterAPI) InitPresets(c *gin.Context) {
 		return
 	}
 
-	results, err := a.CharacterService.InitPresetCharacters(userID.(string))
+	lang := i18n.NormalizeLang(resolveLang(c))
+	results, err := a.CharacterService.InitPresetCharacters(userID.(string), lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -521,7 +590,10 @@ func (a *CharacterAPI) Search(c *gin.Context) {
 	}
 	req.Page, req.PageSize = normalizePagination(req.Page, req.PageSize, 20)
 
-	result, total, err := a.CharacterService.SearchCharacter(req)
+	req.UserID = optionalAccessUserID(c)
+
+	lang := resolveProfileLang(c)
+	result, total, err := a.CharacterService.SearchCharacter(req, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -552,8 +624,10 @@ func (a *CharacterAPI) GetRecommend(c *gin.Context) {
 		return
 	}
 	req.Page, req.PageSize = normalizePagination(req.Page, req.PageSize, 20)
+	req.UserID = optionalAccessUserID(c)
 
-	result, total, err := a.CharacterService.GetRecommend(req)
+	lang := resolveProfileLang(c)
+	result, total, err := a.CharacterService.GetRecommend(req, lang)
 	if err != nil {
 		response.FailWithMessage(c, err.Error())
 		return
@@ -568,6 +642,24 @@ func (a *CharacterAPI) GetRecommend(c *gin.Context) {
 	})
 }
 
+func optionalAccessUserID(c *gin.Context) string {
+	if value, exists := c.Get("user_id"); exists {
+		if userID, ok := value.(string); ok && userID != "" {
+			return userID
+		}
+	}
+	authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+	parts := strings.Fields(authHeader)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return ""
+	}
+	claims, err := utils.ParseToken(parts[1])
+	if err != nil || claims.UserID == "" || (claims.TokenType != "" && claims.TokenType != "access") {
+		return ""
+	}
+	return claims.UserID
+}
+
 // GetCategories 获取角色分类
 // @Summary 获取角色分类
 // @Tags 角色模块
@@ -576,33 +668,8 @@ func (a *CharacterAPI) GetRecommend(c *gin.Context) {
 // @Success 200 {object} response.Response
 // @Router /api/v1/character/categories [get]
 func (a *CharacterAPI) GetCategories(c *gin.Context) {
-	categories := []map[string]interface{}{
-		{"id": "恋人", "name": "恋人", "icon": "heart.fill", "count": 0},
-		{"id": "朋友", "name": "朋友", "icon": "person.2.fill", "count": 0},
-		{"id": "导师", "name": "导师", "icon": "book.fill", "count": 0},
-		{"id": "虚拟偶像", "name": "虚拟偶像", "icon": "star.fill", "count": 0},
-		{"id": "萌宠", "name": "萌宠", "icon": "pawprint.fill", "count": 0},
-		{"id": "二次元", "name": "二次元", "icon": "sparkles", "count": 0},
-		{"id": "医生", "name": "医生", "icon": "cross.case.fill", "count": 0},
-		{"id": "律师", "name": "律师", "icon": "scale.3d", "count": 0},
-		{"id": "教师", "name": "教师", "icon": "graduationcap.fill", "count": 0},
-		{"id": "警察", "name": "警察", "icon": "shield.fill", "count": 0},
-		{"id": "咖啡师", "name": "咖啡师", "icon": "cup.and.saucer.fill", "count": 0},
-		{"id": "灵魂伴侣", "name": "灵魂伴侣", "icon": "sparkling", "count": 0},
-		{"id": "知己", "name": "知己", "icon": "heart.circle.fill", "count": 0},
-		{"id": "青梅竹马", "name": "青梅竹马", "icon": "figure.child", "count": 0},
-	}
-
-	// 获取每个分类的角色数量
-	for i := range categories {
-		var count int64
-		a.CharacterService.DB.Model(&database.Character{}).
-			Where("relationship = ? AND is_public = ?", categories[i]["id"], true).
-			Count(&count)
-		categories[i]["count"] = count
-	}
-
-	response.OkWithData(c, categories)
+	lang := i18n.NormalizeLang(resolveLang(c))
+	response.OkWithData(c, a.CharacterService.GetDiscoverCategories(lang))
 }
 
 // GetConfig 获取角色配置
@@ -652,4 +719,34 @@ func (a *CharacterAPI) UpdateConfig(c *gin.Context) {
 	}
 
 	response.Ok(c)
+}
+
+// GetTagConfig returns character tag config (tag groups + gender + scenes)
+func (api *CharacterAPI) GetTagConfig(c *gin.Context) {
+	configService := api.CharacterConfigService
+	if configService == nil {
+		configService = &service.CharacterConfigService{}
+	}
+	c.JSON(200, gin.H{"errNo": 0, "errMsg": "succ", "data": configService.GetConfig()})
+}
+
+// ResolveChat returns an idempotently resolved character owned by the authenticated user.
+func (a *CharacterAPI) ResolveChat(c *gin.Context) {
+	userID, ok := c.Get("user_id")
+	if !ok {
+		failUnauthenticated(c)
+		return
+	}
+	character, err := a.CharacterService.ResolveChatCharacter(userID.(string), c.Param("character_id"), resolveProfileLang(c))
+	if err != nil {
+		if errors.Is(err, service.ErrCharacterBlocked) {
+			response.FailWithError(c, 403, "character blocked", "character_blocked", nil)
+		} else if errors.Is(err, service.ErrCharacterUnavailable) || errors.Is(err, gorm.ErrRecordNotFound) {
+			response.FailWithError(c, 404, "character unavailable", "character_unavailable", nil)
+		} else {
+			response.FailWithError(c, 500, "could not open character", "character_resolve_failed", nil)
+		}
+		return
+	}
+	response.OkWithData(c, character)
 }

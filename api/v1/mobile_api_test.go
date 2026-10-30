@@ -33,6 +33,7 @@ func setupMobileAPITestDB(t *testing.T) *gorm.DB {
 		&database.Session{},
 		&database.UserCurrency{},
 		&database.Subscription{},
+		&database.Block{},
 	); err != nil {
 		t.Fatalf("migrate mobile api tables: %v", err)
 	}
@@ -52,8 +53,8 @@ func TestGetMobileHomeReturnsFirstScreenPayload(t *testing.T) {
 		CharacterID:  "mobile-api-char",
 		UserID:       "system_admin",
 		Name:         "首屏角色",
-		Gender:       "female",
-		Relationship: "恋人",
+		Gender:       "male",
+		Relationship: "伙伴",
 		IsPublic:     1,
 	}).Error; err != nil {
 		t.Fatalf("create character: %v", err)
@@ -113,7 +114,7 @@ func TestGetMobileHomeDegradesWalletWhenWalletLoadFails(t *testing.T) {
 		CharacterID:  "mobile-api-wallet-error-char",
 		UserID:       "system_admin",
 		Name:         "钱包异常推荐角色",
-		Gender:       "female",
+		Gender:       "male",
 		Relationship: "朋友",
 		IsPublic:     1,
 	}).Error; err != nil {
@@ -381,8 +382,8 @@ func TestPostMobileBatchReturnsSafeAggregates(t *testing.T) {
 			CharacterID:  "batch-char-a",
 			UserID:       "system_admin",
 			Name:         "批量角色A",
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			Personality:  `["温柔","主动"]`,
 			SystemPrompt: "secret prompt",
 			Mem0AgentID:  "secret-agent",
@@ -393,7 +394,7 @@ func TestPostMobileBatchReturnsSafeAggregates(t *testing.T) {
 			CharacterID:  "batch-char-b",
 			UserID:       "system_admin",
 			Name:         "批量角色B",
-			Gender:       "female",
+			Gender:       "male",
 			Relationship: "朋友",
 			IsPublic:     1,
 			ChatCount:    3,
@@ -482,8 +483,8 @@ func TestPostMobileBatchDegradesWalletWhenWalletLoadFails(t *testing.T) {
 			CharacterID:  "batch-wallet-error-char-a",
 			UserID:       "system_admin",
 			Name:         "批量钱包异常角色A",
-			Gender:       "female",
-			Relationship: "恋人",
+			Gender:       "male",
+			Relationship: "伙伴",
 			IsPublic:     1,
 		},
 		{

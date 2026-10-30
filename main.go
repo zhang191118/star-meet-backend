@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	gormlogger "gorm.io/gorm/logger"
 	"html/template"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +28,7 @@ import (
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	mem0 "star-meet-backend/core/mem0"
+	"star-meet-backend/core/qdrant"
 )
 
 func init() {
@@ -49,6 +53,7 @@ func ensureCharacterCustomColumns(db *gorm.DB) error {
 		"birthday",
 		"constellation",
 		"personality_tags",
+		"localized_profile",
 	}
 
 	for _, column := range requiredColumns {
@@ -61,6 +66,73 @@ func ensureCharacterCustomColumns(db *gorm.DB) error {
 		logger.Infof("characters.%s added by schema reconciliation", column)
 	}
 
+	return nil
+}
+
+func ensureMemoryColumns(db *gorm.DB) error {
+	for _, column := range []string{"revision", "indexed_revision"} {
+		if !db.Migrator().HasColumn(&database.Memory{}, column) {
+			if err := db.Migrator().AddColumn(&database.Memory{}, column); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func ensureSessionStateColumns(db *gorm.DB) error {
+	columns := []string{"context_summary", "plot_state", "plot_beat", "plot_threads", "character_emotion", "emotion_intensity"}
+	for _, column := range columns {
+		if db.Migrator().HasColumn(&database.Session{}, column) {
+			continue
+		}
+		if err := db.Migrator().AddColumn(&database.Session{}, column); err != nil {
+			return fmt.Errorf("add sessions.%s failed: %w", column, err)
+		}
+		logger.Infof("sessions.%s added by schema reconciliation", column)
+	}
+	return nil
+}
+
+func ensureUserSettingsColumns(db *gorm.DB) error {
+	columns := []string{"proactive_quiet_start", "proactive_quiet_end", "proactive_daily_limit", "proactive_only_when_away", "proactive_preview_mode", "promise_reminder_enabled"}
+	for _, column := range columns {
+		if db.Migrator().HasColumn(&database.UserSettings{}, column) {
+			continue
+		}
+		if err := db.Migrator().AddColumn(&database.UserSettings{}, column); err != nil {
+			return fmt.Errorf("add user_settings.%s failed: %w", column, err)
+		}
+		logger.Infof("user_settings.%s added by schema reconciliation", column)
+	}
+	return nil
+}
+
+func ensureNotificationColumns(db *gorm.DB) error {
+	columns := []string{"character_id", "deep_link", "proactive_event_id"}
+	for _, column := range columns {
+		if db.Migrator().HasColumn(&database.Notification{}, column) {
+			continue
+		}
+		if err := db.Migrator().AddColumn(&database.Notification{}, column); err != nil {
+			return fmt.Errorf("add notifications.%s failed: %w", column, err)
+		}
+		logger.Infof("notifications.%s added by schema reconciliation", column)
+	}
+	return nil
+}
+
+func ensureProactiveEventColumns(db *gorm.DB) error {
+	columns := []string{"processing_at", "assistant_message_id", "generated_at", "attempt_count", "last_error"}
+	for _, column := range columns {
+		if db.Migrator().HasColumn(&database.ProactiveEvent{}, column) {
+			continue
+		}
+		if err := db.Migrator().AddColumn(&database.ProactiveEvent{}, column); err != nil {
+			return fmt.Errorf("add proactive_events.%s failed: %w", column, err)
+		}
+		logger.Infof("proactive_events.%s added by schema reconciliation", column)
+	}
 	return nil
 }
 
@@ -88,6 +160,49 @@ func ensureUserCurrencyIndexes(db *gorm.DB) error {
 	}
 
 	return nil
+}
+
+// ensureRuntimeConfigTable keeps the deploy-time settings table out of the
+// broad AutoMigrate call. Older production schemas use a legacy unique-index
+// name and some GORM/MySQL combinations try to treat that index as a foreign
+// key while reconciling it. Existing tables are already compatible with the
+// RuntimeConfig model, so only create the table when it is genuinely missing.
+func ensureRuntimeConfigTable(db *gorm.DB) error {
+	migrator := db.Migrator()
+	if migrator.HasTable(&database.RuntimeConfig{}) {
+		return nil
+	}
+	return db.AutoMigrate(&database.RuntimeConfig{})
+}
+
+// safeAutoMigrateModels creates tables that are absent without asking GORM to
+// reconcile every legacy index in an existing production schema. The project
+// has historically used several index naming conventions; reconciling those
+// names on MySQL 8 can be interpreted as dropping a foreign key.
+func safeAutoMigrateModels(db *gorm.DB, models ...interface{}) error {
+	migrator := db.Migrator()
+	for _, model := range models {
+		if migrator.HasTable(model) {
+			continue
+		}
+		if err := db.AutoMigrate(model); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func schemaOnlyFailure(enabled bool, message string, err error) error {
+	if !enabled || err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", message, err)
+}
+
+func failSchemaOnly(enabled bool, message string, err error) {
+	if failure := schemaOnlyFailure(enabled, message, err); failure != nil {
+		logger.Fatalf("schema-only migration failed: %v", failure)
+	}
 }
 
 func runtimeConfigValue(key, viperKey, envKey, defaultValue string) string {
@@ -127,6 +242,7 @@ func seedRuntimeConfigDefaults() {
 	}
 
 	defaults := []service.RuntimeConfigDefault{
+		{Key: "embedding.api_key", Value: runtimeConfigSensitiveSeedValue("embedding.api_key", "EMBEDDING_API_KEY"), Sensitive: true, Description: "Zhipu embedding API key; separate from the chat provider"},
 		{
 			Key:         service.RuntimeConfigOpenAICompatBaseURL,
 			Value:       runtimeConfigSeedValue("openai_compat.base_url", "OPENAI_COMPAT_BASE_URL", "https://ai98pro.xyz"),
@@ -145,7 +261,27 @@ func seedRuntimeConfigDefaults() {
 			Sensitive:   false,
 			Description: "OpenAI-compatible primary chat model",
 		},
+		{
+			Key:         "music.enabled",
+			Value:       "true",
+			Sensitive:   false,
+			Description: "聊天背景音乐开关 (true/false)",
+		},
+		{
+			Key:         service.RuntimeConfigResendAPIKey,
+			Value:       runtimeConfigSensitiveSeedValue("", "RESEND_API_KEY"),
+			Sensitive:   true,
+			Description: "Resend 邮件服务 API Key（发送注册/重置密码验证码邮件）",
+		},
+		{
+			Key:         service.RuntimeConfigResendFrom,
+			Value:       runtimeConfigSeedValue("", "RESEND_FROM", "StarMeet <noreply@kwbb.com>"),
+			Sensitive:   false,
+			Description: "Resend 发件人，格式：StarMeet <noreply@已验证域名>",
+		},
 	}
+	defaults = append(defaults, service.ChatQuotaRuntimeDefaults()...)
+	defaults = append(defaults, service.ChatContextRuntimeDefaults()...)
 
 	if err := global.RuntimeConfigService.SeedDefaults(defaults); err != nil {
 		logger.Warnf("运行时配置默认项写入数据库失败: %v", err)
@@ -183,10 +319,56 @@ func isRuntimeConfigPlaceholder(value string) bool {
 		strings.HasPrefix(normalized, "change-me")
 }
 
+func isProductionMode() bool {
+	for _, key := range []string{"GIN_MODE", "APP_ENV", "ENVIRONMENT"} {
+		value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+		if value == "release" || value == "production" || value == "prod" {
+			return true
+		}
+	}
+	mode := strings.ToLower(strings.TrimSpace(viper.GetString("server.mode")))
+	return mode == "release" || mode == "production" || mode == "prod"
+}
+
+func configureAPNs(notificationService *service.NotificationService) {
+	if notificationService == nil {
+		return
+	}
+	keyID := runtimeConfigValue("apns.key_id", "apns.key_id", "APNS_KEY_ID", "")
+	teamID := runtimeConfigValue("apns.team_id", "apns.team_id", "APNS_TEAM_ID", "")
+	topic := runtimeConfigValue("apns.topic", "apns.topic", "APNS_TOPIC", "")
+	privateKey := runtimeConfigValue("apns.private_key", "apns.private_key", "APNS_PRIVATE_KEY", "")
+	privateKeyPath := runtimeConfigValue("apns.private_key_path", "apns.private_key_path", "APNS_PRIVATE_KEY_PATH", "")
+	if strings.TrimSpace(privateKey) == "" && strings.TrimSpace(privateKeyPath) != "" {
+		contents, err := os.ReadFile(privateKeyPath)
+		if err != nil {
+			logger.Warnf("APNs私钥读取失败: %v", err)
+			return
+		}
+		privateKey = string(contents)
+	}
+	if strings.TrimSpace(keyID) == "" && strings.TrimSpace(teamID) == "" && strings.TrimSpace(topic) == "" && strings.TrimSpace(privateKey) == "" {
+		logger.Info("APNs未配置，主动陪伴推播扫描器保持静默")
+		return
+	}
+	environment := strings.ToLower(strings.TrimSpace(runtimeConfigValue("apns.environment", "apns.environment", "APNS_ENVIRONMENT", "production")))
+	client, err := service.NewAPNsClient(service.APNsConfig{
+		KeyID: keyID, TeamID: teamID, Topic: topic, PrivateKey: privateKey,
+		UseProduction: environment != "sandbox" && environment != "development",
+	})
+	if err != nil {
+		logger.Warnf("APNs配置无效: %v", err)
+		return
+	}
+	notificationService.ConfigureAPNs(client)
+	logger.Infof("APNs推播已启用 (%s)", environment)
+}
+
 func main() {
 	// 初始化配置
 	port := flag.String("port", "8080", "server port")
 	host := flag.String("host", "127.0.0.1", "server host")
+	schemaOnly := flag.Bool("schema-only", false, "apply database schema migrations and exit")
 	flag.Parse()
 
 	// 读取配置文件
@@ -270,20 +452,26 @@ func main() {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local&timeout=10s&readTimeout=30s&writeTimeout=30s",
 		dbUser, dbPassword, dbHost, dbPort, dbName)
 
+	databaseLogger := gormlogger.New(log.New(os.Stdout, "", log.LstdFlags), gormlogger.Config{SlowThreshold: time.Second, LogLevel: gormlogger.Warn, IgnoreRecordNotFoundError: true, ParameterizedQueries: true, Colorful: false})
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{
+		Logger: databaseLogger,
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
 		},
 	})
 	if err != nil {
+		dbEndpoint := fmt.Sprintf("%s:%s/%s", dbHost, dbPort, dbName)
+		if *schemaOnly {
+			logger.Fatalf("schema-only MySQL连接失败 (%s): %v。SQLite回退已禁用。", dbEndpoint, err)
+		}
 		if dbHost != "127.0.0.1" && dbHost != "localhost" {
-			logger.Fatalf("MySQL连接失败 (%s): %v。在非本地环境不使用SQLite回退。", dsn, err)
+			logger.Fatalf("MySQL连接失败 (%s): %v。在非本地环境不使用SQLite回退。", dbEndpoint, err)
 		}
 
-		logger.Infof("MySQL连接失败 (%s): %v，尝试使用SQLite", dsn, err)
+		logger.Infof("MySQL连接失败 (%s): %v，尝试使用SQLite", dbEndpoint, err)
 
 		// 使用SQLite作为备用
-		db, err = gorm.Open(sqlite.Open("star_meet.db"), &gorm.Config{})
+		db, err = gorm.Open(sqlite.Open("star_meet.db"), &gorm.Config{Logger: databaseLogger})
 		if err != nil {
 			logger.Fatalf("无法创建数据库: %v", err)
 		}
@@ -291,8 +479,11 @@ func main() {
 
 	// 自动迁移表
 	db.Config.DisableForeignKeyConstraintWhenMigrating = true
-	err = db.AutoMigrate(
-		&database.RuntimeConfig{},
+	if err := ensureRuntimeConfigTable(db); err != nil {
+		failSchemaOnly(*schemaOnly, "runtime_configs 表初始化失败", err)
+		logger.Errorf("runtime_configs 表初始化失败: %v", err)
+	}
+	err = safeAutoMigrateModels(db,
 		&database.Plan{},
 		&database.User{},
 		&database.UserSettings{},
@@ -301,8 +492,12 @@ func main() {
 		&database.Message{},
 		&database.Favorite{},
 		&database.Memory{},
+		&database.MemoryIndexJob{},
+		&database.Feedback{},
+		&database.ProductEvent{},
 		&database.Knowledge{},
 		&database.Subscription{},
+		&database.AppleTransactionOwner{},
 		&database.UserCurrency{},
 		&database.CurrencyTransaction{},
 		&database.RechargePackage{},
@@ -311,20 +506,65 @@ func main() {
 		&database.UserGachaDraw{},
 		&database.UserGachaRecord{},
 		&database.UserCharacter{},
+		&database.Notification{},
+		&database.PushDevice{},
+		&database.ProactiveEvent{},
+		&database.UserCharacterNotificationSetting{},
+		&database.Report{},
+		&database.Block{},
+		&database.UserAffection{},
+		&database.CharacterMoment{},
+		&database.Music{},
 	)
 	if err != nil {
-		logger.Infof("表迁移失败: %v", err)
+		failSchemaOnly(*schemaOnly, "表迁移失败", err)
+		logger.Errorf("表迁移失败，API 将继续启动但需要人工修复 schema: %v", err)
 	} else {
 		logger.Info("数据库迁移成功")
 	}
 	if err := ensureCharacterCustomColumns(db); err != nil {
+		failSchemaOnly(*schemaOnly, "角色扩展字段补齐失败", err)
 		logger.Warnf("角色扩展字段补齐失败: %v", err)
 	}
+	for _, model := range []interface{}{&database.Feedback{}, &database.ProductEvent{}, &database.MemoryIndexJob{}} {
+		if !db.Migrator().HasTable(model) {
+			logger.Fatalf("growth schema initialization incomplete; required table missing")
+		}
+	}
+	if !db.Migrator().HasTable(&database.AppleTransactionOwner{}) {
+		logger.Fatalf("apple transaction ownership schema initialization incomplete; required table missing")
+	}
+	if err := ensureMemoryColumns(db); err != nil {
+		logger.Fatalf("memory schema initialization failed: %v", err)
+	}
+	if err := ensureSessionStateColumns(db); err != nil {
+		failSchemaOnly(*schemaOnly, "会话状态字段补齐失败", err)
+		logger.Warnf("会话状态字段补齐失败: %v", err)
+	}
+	if err := ensureUserSettingsColumns(db); err != nil {
+		failSchemaOnly(*schemaOnly, "主动陪伴设置字段补齐失败", err)
+		logger.Warnf("主动陪伴设置字段补齐失败: %v", err)
+	}
+	if err := ensureNotificationColumns(db); err != nil {
+		failSchemaOnly(*schemaOnly, "通知深链字段补齐失败", err)
+		logger.Warnf("通知深链字段补齐失败: %v", err)
+	}
+	if err := ensureProactiveEventColumns(db); err != nil {
+		failSchemaOnly(*schemaOnly, "主动事件处理字段补齐失败", err)
+		logger.Warnf("主动事件处理字段补齐失败: %v", err)
+	}
 	if err := ensureUserCurrencyIndexes(db); err != nil {
+		failSchemaOnly(*schemaOnly, "用户货币索引补齐失败", err)
 		logger.Warnf("用户货币索引补齐失败: %v", err)
 	}
 
+	if *schemaOnly {
+		logger.Info("schema-only migration completed successfully")
+		return
+	}
+
 	global.GVA_DB = db
+	middleware.SetAuthDB(db)
 	global.RuntimeConfigService = global.NewRuntimeConfigService(db)
 	seedRuntimeConfigDefaults()
 
@@ -365,8 +605,12 @@ func main() {
 
 	jwtSecret := runtimeConfigValue("jwt.secret", "jwt.jwt_secret", "JWT_SECRET", "")
 	utils.SetJWTSecret(jwtSecret)
-	if jwtSecret == "" || jwtSecret == "star-meet-secret-key-change-in-production" {
-		logger.Warn("JWT secret uses development fallback; configure runtime_configs.jwt.secret before production")
+	if isRuntimeConfigPlaceholder(jwtSecret) || jwtSecret == "star-meet-secret-key-change-in-production" {
+		logger.Warn("JWT secret uses a development fallback; configure runtime_configs.jwt.secret before production")
+	} else if isProductionMode() && len(jwtSecret) < 32 {
+		// Keep existing deployments compatible. Rotating the secret is an
+		// operational decision because it invalidates every active token.
+		logger.Warnf("生产环境 JWT_SECRET 长度为 %d，建议在计划好的密钥轮换窗口升级到至少 32 位", len(jwtSecret))
 	}
 
 	// 初始化AI客户端（可选配置）
@@ -461,6 +705,18 @@ func main() {
 		FromEmail: emailFromEmail,
 	})
 
+	// Resend 配置：数据库 runtime_config 优先（改动即时生效），环境变量兜底
+	service.ResendConfigResolver = func() (string, string) {
+		return runtimeConfigValue(service.RuntimeConfigResendAPIKey, "", "RESEND_API_KEY", ""),
+			runtimeConfigValue(service.RuntimeConfigResendFrom, "", "RESEND_FROM", "")
+	}
+
+	// LINE 登录频道配置：数据库优先（敏感值存库不落 .env），环境变量兜底
+	service.LineConfigResolver = func() (string, string) {
+		return runtimeConfigValue(service.RuntimeConfigLineChannelID, "", "LINE_CHANNEL_ID", ""),
+			runtimeConfigValue(service.RuntimeConfigLineChannelSecret, "", "LINE_CHANNEL_SECRET", "")
+	}
+
 	coreoss.SetConfig(coreoss.Config{
 		Endpoint:        runtimeConfigValue("oss.endpoint", "oss.endpoint", "OSS_ENDPOINT", ""),
 		AccessKeyID:     runtimeConfigValue("oss.access_key_id", "oss.access_key_id", "OSS_ACCESS_KEY_ID", ""),
@@ -469,24 +725,49 @@ func main() {
 	})
 
 	// 智谱AI Embedding客户端 (用于向量记忆)
-	embeddingClient := global.NewEmbeddingClient(miniMaxAPIKey)
+	embeddingAPIKey := runtimeConfigValue("embedding.api_key", "embedding.api_key", "EMBEDDING_API_KEY", "")
+	embeddingClient := global.NewEmbeddingClient(embeddingAPIKey)
 	global.EmbeddingClient = embeddingClient
 
-	// Qdrant向量数据库客户端
-	qdrantHost := runtimeConfigValue("qdrant.host", "qdrant.host", "QDRANT_HOST", "http://localhost:6333")
-	qdrantClient := global.NewQdrantClient(qdrantHost)
+	// Qdrant向量数据库客户端。未配置时保持 nil：向量记忆读写与删号清理整体跳过，
+	// 避免默认 localhost 地址连不通导致账号删除被硬依赖阻塞。
+	qdrantHost := runtimeConfigValue("qdrant.host", "qdrant.host", "QDRANT_HOST", "")
+	var qdrantClient *qdrant.Client
+	if qdrantHost != "" {
+		qdrantClient = global.NewQdrantClient(qdrantHost)
+		logger.Infof("Qdrant vector database initialized: %s", qdrantHost)
+	} else {
+		logger.Warn("Qdrant host not configured, vector memory disabled")
+	}
 	global.QdrantClient = qdrantClient
-	logger.Infof("Qdrant vector database initialized: %s", qdrantHost)
 
 	// 初始化服务层
 	global.VerifyCodeService = global.NewVerifyCodeService(db, redisClient)
-	global.UserService = global.NewUserService(db, global.VerifyCodeService)
+	global.UserService = global.NewUserService(db, global.VerifyCodeService, mem0Client, qdrantClient)
 	global.CharacterService = global.NewCharacterService(db)
 	global.MemoryService = global.NewMemoryService(db, mem0Client)
+	global.CharacterService.Memory = global.MemoryService
+	go global.MemoryService.RunIndexWorker(context.Background())
+	global.MomentService = global.NewMomentService(db)
+	global.MusicService = service.NewMusicService(db)
 	global.MobileService = global.NewMobileService(db)
 	knowledgeService := global.NewKnowledgeService(db)
 	global.KnowledgeService = knowledgeService
+	global.NotificationService = global.NewNotificationService(db)
+	configureAPNs(global.NotificationService)
 	global.ChatService = global.NewChatService(db, redisClient, mem0Client, qwenClient, miniMaxClient, openAICompatClient, deepSeekClient, geminiClient, embeddingClient, qdrantClient, knowledgeService, global.RuntimeConfigService)
+	global.ChatService.Notification = global.NotificationService
+	global.ChatService.Memory = global.MemoryService
+	global.ChatService.Analytics = &service.AnalyticsService{DB: db}
+	global.ChatService.Director = &service.DirectorService{
+		DB:                 db,
+		Redis:              redisClient,
+		OpenAICompatClient: openAICompatClient,
+	}
+	global.NotificationService.ConfigureProactiveGenerator(global.ChatService)
+	go global.NotificationService.RunProactiveScanner(context.Background(), 5*time.Minute)
+	global.CharacterService.Notification = global.NotificationService
+	global.UserService.Notification = global.NotificationService
 
 	// 初始化知识库
 	if err := global.KnowledgeService.InitKnowledgeBase(); err != nil {
@@ -498,7 +779,10 @@ func main() {
 	// 强制初始化公共角色 (确保 季夏 等新角色出现)
 	logger.Info("正在初始化公共角色...")
 	// 使用统一的 system_admin ID，并清理之前的同名角色确保更新
-	global.CharacterService.InitPresetCharacters("system_admin")
+	global.CharacterService.InitPresetCharacters("system_admin", "en")
+	// 初始化默认音乐
+	seedDefaultMusic()
+	// 初始化抽卡
 	if err := service.NewGachaService(db).EnsureDefaultGachaContent(); err != nil {
 		logger.Warnf("默认抽卡池初始化失败: %v", err)
 	} else {
@@ -529,6 +813,16 @@ func main() {
 	Router.GET("/admin", func(c *gin.Context) {
 		c.HTML(200, "index.html", nil)
 	})
+	Router.GET("/privacy", func(c *gin.Context) {
+		c.HTML(200, "privacy.html", nil)
+	})
+	Router.GET("/terms", func(c *gin.Context) {
+		c.HTML(200, "terms.html", nil)
+	})
+	Router.GET("/admin/growth", func(c *gin.Context) { c.HTML(200, "growth.html", nil) })
+	Router.GET("/support", func(c *gin.Context) {
+		c.HTML(200, "support.html", nil)
+	})
 
 	// 限流中间件
 	Router.Use(middleware.RateLimiter())
@@ -552,6 +846,10 @@ func main() {
 
 		// 检查AI服务配置状态
 		aiStatus := make(map[string]string)
+		pushStatus := "not_configured"
+		if global.NotificationService != nil && global.NotificationService.APNs != nil {
+			pushStatus = "configured"
+		}
 
 		// MiniMax
 		if miniMaxAPIKey != "" {
@@ -614,6 +912,7 @@ func main() {
 				"components": gin.H{
 					"database": dbStatus,
 					"redis":    redisStatus,
+					"apns":     pushStatus,
 				},
 				"ai_services": aiStatus,
 			},
@@ -628,5 +927,32 @@ func main() {
 	logger.Infof("服务启动成功: http://%s", addr)
 	logger.Infof("健康检查: http://%s/health", addr)
 
-	Router.Run(addr)
+	if err := Router.Run(addr); err != nil {
+		logger.Errorf("HTTP 服务启动失败 (%s): %v", addr, err)
+		return
+	}
+}
+
+// seedDefaultMusic 初始化默认背景音乐数据
+func seedDefaultMusic() {
+	musicService := service.NewMusicService(global.GVA_DB)
+	// 暧昧氛围向内置曲目（Mixkit 免费商用许可），文件名为 Mixkit 曲目 ID
+	defaults := []database.Music{
+		{Title: "Lounging By Moonlight", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/40.mp3", Duration: 0, Sort: 1, Enabled: true},
+		{Title: "Latin Lovers", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/39.mp3", Duration: 0, Sort: 2, Enabled: true},
+		{Title: "Love in the Air", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/41.mp3", Duration: 0, Sort: 3, Enabled: true},
+		{Title: "Forever Love", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/38.mp3", Duration: 0, Sort: 4, Enabled: true},
+		{Title: "Beautiful Dream", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/493.mp3", Duration: 0, Sort: 5, Enabled: true},
+		{Title: "Old Letter", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/854.mp3", Duration: 0, Sort: 6, Enabled: true},
+		{Title: "We'll Be Okay", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/1081.mp3", Duration: 0, Sort: 7, Enabled: true},
+		{Title: "Pop One", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/664.mp3", Duration: 0, Sort: 8, Enabled: true},
+		{Title: "Possible Dreams", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/599.mp3", Duration: 0, Sort: 9, Enabled: true},
+		{Title: "J.B. R&B Music", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/227.mp3", Duration: 0, Sort: 10, Enabled: true},
+		{Title: "Slow Pop", Artist: "Mixkit", URL: "https://star-meet.oss-cn-hangzhou.aliyuncs.com/music/351.mp3", Duration: 0, Sort: 11, Enabled: true},
+	}
+	if err := musicService.SeedDefaults(defaults); err != nil {
+		logger.Warnf("默认音乐数据初始化失败: %v", err)
+	} else {
+		logger.Info("默认音乐数据初始化完成")
+	}
 }

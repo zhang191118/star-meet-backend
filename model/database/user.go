@@ -22,6 +22,7 @@ type User struct {
 	// 3rd Party Login
 	WechatOpenID string `json:"wechat_openid" gorm:"index;size:64" json:"wechat_openid"`
 	AppleUserID  string `json:"apple_user_id" gorm:"index;size:64" json:"apple_user_id"`
+	LineUserID   string `json:"line_user_id" gorm:"index;size:64" json:"line_user_id"`
 
 	// Minor Protection & Compliance
 	Age            int        `json:"age" gorm:"default:0" json:"age"`

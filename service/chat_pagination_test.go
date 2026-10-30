@@ -58,6 +58,52 @@ func TestChatHistoryPageSizeIsClamped(t *testing.T) {
 	}
 }
 
+func TestChatHistorySeedsSceneThenCharacterOpeningOnce(t *testing.T) {
+	db := setupChatStreamMetadataTestDB(t)
+	if err := db.Create(&database.User{UserID: "opening-user", Nickname: "开场用户"}).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := db.Create(&database.Character{
+		CharacterID:    "opening-char",
+		UserID:         "system_admin",
+		Name:           "开场角色",
+		Gender:         "female",
+		Relationship:   "伙伴",
+		Narrative:      "旧版故事梗概",
+		FirstSituation: "夜色中的车站只剩下你和她。",
+		FirstWords:     "你也在等这班车吗？",
+		IsPublic:       1,
+	}).Error; err != nil {
+		t.Fatalf("create character: %v", err)
+	}
+
+	service := &ChatService{DB: db}
+	messages, total, err := service.GetHistory("opening-user", "opening-char", 1, 20)
+	if err != nil {
+		t.Fatalf("get opening history: %v", err)
+	}
+	if total != 2 || len(messages) != 2 {
+		t.Fatalf("expected two opening messages, total=%d messages=%d", total, len(messages))
+	}
+	if messages[0].MessageType != "text" || messages[0].Content != "你也在等这班车吗？" {
+		t.Fatalf("expected character words second in timeline, got %+v", messages[0])
+	}
+	if messages[1].MessageType != "narrative" || messages[1].Content != "夜色中的车站只剩下你和她。" {
+		t.Fatalf("expected story background in timeline, got %+v", messages[1])
+	}
+
+	if _, _, err := service.GetHistory("opening-user", "opening-char", 1, 20); err != nil {
+		t.Fatalf("reload opening history: %v", err)
+	}
+	var count int64
+	if err := db.Model(&database.Message{}).Where("user_id = ? AND character_id = ?", "opening-user", "opening-char").Count(&count).Error; err != nil {
+		t.Fatalf("count opening messages: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected idempotent opening seed, got %d messages", count)
+	}
+}
+
 func TestChatHistorySupportsBeforeIDCursor(t *testing.T) {
 	db := setupChatStreamMetadataTestDB(t)
 	now := time.Now()
@@ -197,7 +243,7 @@ func TestChatSessionsPageSizeIsClamped(t *testing.T) {
 	}
 
 	service := &ChatService{DB: db}
-	sessions, total, err := service.GetSessions("session-page-user", 1, 1000)
+	sessions, total, err := service.GetSessions("session-page-user", 1, 1000, "en")
 	if err != nil {
 		t.Fatalf("get sessions: %v", err)
 	}
@@ -242,7 +288,7 @@ func TestChatSessionsUseStableIDTieBreakerForSameRank(t *testing.T) {
 	}
 
 	service := &ChatService{DB: db}
-	sessions, total, err := service.GetSessions("session-stable-user", 1, 3)
+	sessions, total, err := service.GetSessions("session-stable-user", 1, 3, "en")
 	if err != nil {
 		t.Fatalf("get sessions: %v", err)
 	}

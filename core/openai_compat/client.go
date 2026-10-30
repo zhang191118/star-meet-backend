@@ -3,6 +3,7 @@ package openai_compat
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +69,10 @@ func (c *Client) Configured() bool {
 }
 
 func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (string, error) {
+	return c.GenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) GenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (string, error) {
 	if !c.Configured() {
 		return "", fmt.Errorf("openai-compatible client not configured")
 	}
@@ -77,7 +82,7 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 		return "", err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.chatCompletionsURL(), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatCompletionsURL(), bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -91,7 +96,7 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("openai-compatible api error: %d - %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("openai-compatible api error: status=%d", resp.StatusCode)
 	}
 
 	var genResp GenerateResponse
@@ -99,7 +104,7 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 		return "", fmt.Errorf("openai-compatible response parse error: %w", err)
 	}
 	if genResp.Error != nil && genResp.Error.Message != "" {
-		return "", fmt.Errorf("openai-compatible api error: %s", genResp.Error.Message)
+		return "", fmt.Errorf("openai-compatible provider returned an error")
 	}
 	if len(genResp.Choices) == 0 || strings.TrimSpace(genResp.Choices[0].Message.Content) == "" {
 		return "", fmt.Errorf("openai-compatible api returned no choices")
@@ -109,6 +114,10 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 }
 
 func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens int) (<-chan string, <-chan error) {
+	return c.StreamGenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) StreamGenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (<-chan string, <-chan error) {
 	ch := make(chan string)
 	errCh := make(chan error, 1)
 
@@ -129,7 +138,7 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 			return
 		}
 
-		req, err := http.NewRequest(http.MethodPost, c.chatCompletionsURL(), bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatCompletionsURL(), bytes.NewReader(body))
 		if err != nil {
 			errCh <- err
 			return
@@ -144,23 +153,15 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 		defer resp.Body.Close()
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			respBody, _ := io.ReadAll(resp.Body)
-			errCh <- fmt.Errorf("openai-compatible api error: %d - %s", resp.StatusCode, string(respBody))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			errCh <- fmt.Errorf("openai-compatible api error: status=%d", resp.StatusCode)
 			return
 		}
 
-		reader := bufio.NewReader(resp.Body)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					return
-				}
-				errCh <- err
-				return
-			}
-
-			line = strings.TrimSpace(line)
+		reader := bufio.NewScanner(resp.Body)
+		reader.Buffer(make([]byte, 4096), 1024*1024)
+		for reader.Scan() {
+			line := strings.TrimSpace(reader.Text())
 			if !strings.HasPrefix(line, "data:") {
 				continue
 			}
@@ -177,7 +178,7 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 				continue
 			}
 			if genResp.Error != nil && genResp.Error.Message != "" {
-				errCh <- fmt.Errorf("openai-compatible api error: %s", genResp.Error.Message)
+				errCh <- fmt.Errorf("openai-compatible provider returned an error")
 				return
 			}
 			if len(genResp.Choices) == 0 {
@@ -185,8 +186,24 @@ func (c *Client) StreamGenerate(prompt string, systemPrompt string, maxTokens in
 			}
 			content := genResp.Choices[0].Delta.Content
 			if content != "" {
-				ch <- content
+				select {
+				case ch <- content:
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
 			}
+			// DashScope serialises "null" as a string on every non-terminal chunk;
+			// treating it as terminal returns after the first token.
+			if reason := strings.ToLower(strings.TrimSpace(genResp.Choices[0].FinishReason)); reason != "" && reason != "null" {
+				return
+			}
+		}
+		if err := reader.Err(); err != nil {
+			errCh <- err
+		} else {
+			// A clean TCP EOF is not a completed generation without a terminal marker.
+			errCh <- io.ErrUnexpectedEOF
 		}
 	}()
 

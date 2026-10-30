@@ -79,15 +79,15 @@ func (s *KnowledgeService) getEmotionData() []database.Knowledge {
 		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "wronged", Content: "呜呜呜，听起来就好委屈哦~宝贝不哭，我心疼死了🥺来，让我抱抱你~", Keywords: "委屈,想哭,伤心", Emotion: "sad"},
 		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "wronged", Content: "哎呀，看把我们小可怜委屈的！来，姐疼你~🤗不管发生什么，你还有我呢！", Keywords: "委屈,难过,伤心", Emotion: "sad"},
 
-		// 撒娇情绪
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "哎呀~老公/老婆~你最好了~帮我这个嘛~好不好嘛~人家想要~🥺💕", Keywords: "撒娇,求,想要,好不好", Emotion: "love"},
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "嗯~不要嘛~人家就要这个~你最好了~么么哒~😘亲爱的~", Keywords: "撒娇,可爱,人家", Emotion: "love"},
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "哎呀~哥哥/姐姐~帮帮人家嘛~人家会很乖的~💖求求你啦~", Keywords: "撒娇,求求,帮忙", Emotion: "love"},
+		// 温暖情绪
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "哎呀~你最好了~帮我看看这个嘛~好不好嘛~谢谢你~🤗", Keywords: "温暖,求,想要,好不好", Emotion: "love"},
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "嗯~不用啦~我自己可以的~你真好~谢谢你~😊", Keywords: "温暖,可爱,人家", Emotion: "love"},
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "cute", Content: "哎呀~伙伴~帮帮我嘛~我会很感谢的~💖拜托啦~", Keywords: "温暖,求求,帮忙", Emotion: "love"},
 
-		// 暧昧情绪
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "哎呀，你好坏哦~不过我喜欢~😘有没有想我呀？", Keywords: "暧昧,想你,喜欢,坏", Emotion: "love"},
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "啾咪~😘今天表现不错哦~继续加油~💖", Keywords: "暧昧,心动,喜欢", Emotion: "love"},
-		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "嘿嘿~你今天有点帅哦~看得我心跳加速~😚", Keywords: "暧昧,心动", Emotion: "love"},
+		// 互动情绪
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "哎呀，你真有趣~跟你聊天很开心~😊最近怎么样呀？", Keywords: "暧昧,想你,喜欢,坏", Emotion: "love"},
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "嘿嘿~今天表现不错哦~继续加油~💪", Keywords: "暧昧,心动,喜欢", Emotion: "love"},
+		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "flirty", Content: "嘿嘿~你今天状态不错哦~看起来很有精神~😊", Keywords: "暧昧,心动", Emotion: "love"},
 
 		// 深夜治愈
 		{KnowledgeID: uuidNew(), Category: "emotion", SubCategory: "night", Content: "这么晚还不睡呀？熬夜对身体不好哦~😴但是有我陪你，熬夜也值得对不对？晚安，爱你~💤", Keywords: "晚安,睡觉,熬夜,夜深", Emotion: "neutral"},

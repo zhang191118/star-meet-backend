@@ -1,8 +1,10 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,15 +23,30 @@ func setupSubscriptionServiceTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 
-	if err := db.AutoMigrate(&database.User{}, &database.Plan{}, &database.Subscription{}); err != nil {
+	if err := db.AutoMigrate(&database.User{}, &database.Plan{}, &database.Subscription{}, &database.AppleTransactionOwner{}); err != nil {
 		t.Fatalf("migrate subscription tables: %v", err)
 	}
 
 	return db
 }
 
-func TestGetPlansReturnsFallbackWhenDatabaseIsEmpty(t *testing.T) {
+func futureAppleExpiry() string {
+	return fmt.Sprintf("%d", time.Now().Add(24*time.Hour).UnixMilli())
+}
+
+func TestGetPlansReturnsThePublicWeeklyAndMonthlyPlans(t *testing.T) {
 	db := setupSubscriptionServiceTestDB(t)
+	if err := db.Create(&database.Plan{
+		PlanID:         "yearly",
+		Name:           "Legacy yearly",
+		Level:          "yearly",
+		AppleProductID: "com.guoliang.starmeet.yearly",
+		Price:          268,
+		Currency:       "CNY",
+		Duration:       365,
+	}).Error; err != nil {
+		t.Fatalf("create legacy plan: %v", err)
+	}
 	service := NewSubscriptionService(db)
 
 	plans, err := service.GetPlans()
@@ -37,11 +54,15 @@ func TestGetPlansReturnsFallbackWhenDatabaseIsEmpty(t *testing.T) {
 		t.Fatalf("get plans: %v", err)
 	}
 
-	if len(plans) != 4 {
-		t.Fatalf("expected 4 fallback plans, got %d", len(plans))
+	if len(plans) != 2 {
+		t.Fatalf("expected two public plans, got %d", len(plans))
 	}
-	if plans[0].PlanID != "monthly" || plans[1].PlanID != "quarterly" || plans[2].PlanID != "yearly" || plans[3].PlanID != "lifetime" {
-		t.Fatalf("unexpected fallback plans: %+v", plans)
+	// Weekly is listed first because the paywall selects it by default.
+	if plans[0].PlanID != "weekly" || plans[0].Level != "weekly" || plans[0].AppleProductID != "com.guoliang.starmeet.weekly" || plans[0].Price != 90 || plans[0].Currency != "TWD" || plans[0].Duration != 7 {
+		t.Fatalf("unexpected weekly plan: %+v", plans[0])
+	}
+	if plans[1].PlanID != "monthly" || plans[1].Name != "StarMeet VIP" || plans[1].Price != 170 || plans[1].Currency != "TWD" {
+		t.Fatalf("unexpected monthly plan: %+v", plans[1])
 	}
 }
 
@@ -214,10 +235,10 @@ func TestVerifyAppleReceiptRetriesSandboxOn21007(t *testing.T) {
 				Environment: "Sandbox",
 				LatestReceiptInfo: []appleReceiptItem{
 					{
-						ProductID:             "com.starmeet.monthly",
+						ProductID:             "com.guoliang.starmeet.monthly",
 						OriginalTransactionID: "txn-sandbox",
 						TransactionID:         "txn-sandbox-1",
-						ExpiresDateMs:         "100",
+						ExpiresDateMs:         futureAppleExpiry(),
 					},
 				},
 			}, nil
@@ -251,10 +272,10 @@ func TestVerifyAppleReceiptRejectsMismatchedProduct(t *testing.T) {
 			Status: 0,
 			LatestReceiptInfo: []appleReceiptItem{
 				{
-					ProductID:             "com.starmeet.yearly",
+					ProductID:             "com.guoliang.starmeet.yearly",
 					OriginalTransactionID: "txn-mismatch",
 					TransactionID:         "txn-mismatch-1",
-					ExpiresDateMs:         "100",
+					ExpiresDateMs:         futureAppleExpiry(),
 				},
 			},
 		}, nil
@@ -266,6 +287,42 @@ func TestVerifyAppleReceiptRejectsMismatchedProduct(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "不匹配") {
 		t.Fatalf("expected mismatch error, got %v", err)
+	}
+}
+
+func TestVerifyAppleReceiptSelectsLatestTransactionForRequestedProduct(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+
+	original := appleVerifyReceiptRequestFunc
+	defer func() { appleVerifyReceiptRequestFunc = original }()
+	appleVerifyReceiptRequestFunc = func(url string, payload map[string]interface{}) (*appleVerifyReceiptResponse, error) {
+		return &appleVerifyReceiptResponse{
+			Status:      0,
+			Environment: "Production",
+			LatestReceiptInfo: []appleReceiptItem{
+				{
+					ProductID:             "com.guoliang.starmeet.monthly",
+					OriginalTransactionID: "monthly-original",
+					TransactionID:         "monthly-old",
+					ExpiresDateMs:         futureAppleExpiry(),
+				},
+				{
+					ProductID:             "com.guoliang.starmeet.yearly",
+					OriginalTransactionID: "yearly-original",
+					TransactionID:         "yearly-new",
+					ExpiresDateMs:         futureAppleExpiry(),
+				},
+			},
+		}, nil
+	}
+
+	verification, err := service.VerifyAppleReceipt("dGVzdA==", "monthly", false)
+	if err != nil {
+		t.Fatalf("verify receipt: %v", err)
+	}
+	if verification.OriginalTransactionID != "monthly-original" {
+		t.Fatalf("expected monthly transaction, got %q", verification.OriginalTransactionID)
 	}
 }
 
@@ -299,9 +356,9 @@ func TestVerifyAppleReceiptRejectsMissingOriginalTransactionID(t *testing.T) {
 			Status: 0,
 			LatestReceiptInfo: []appleReceiptItem{
 				{
-					ProductID:     "com.starmeet.monthly",
+					ProductID:     "com.guoliang.starmeet.monthly",
 					TransactionID: "txn-no-original",
-					ExpiresDateMs: "100",
+					ExpiresDateMs: futureAppleExpiry(),
 				},
 			},
 		}, nil
@@ -313,5 +370,377 @@ func TestVerifyAppleReceiptRejectsMissingOriginalTransactionID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "缺少原始交易号") {
 		t.Fatalf("expected missing original transaction id error, got %v", err)
+	}
+}
+
+func TestVerifyAppleReceiptAcceptsWeeklyTrialExpiry(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+
+	trialEnd := time.Now().Add(3 * 24 * time.Hour)
+
+	original := appleVerifyReceiptRequestFunc
+	defer func() { appleVerifyReceiptRequestFunc = original }()
+	appleVerifyReceiptRequestFunc = func(url string, payload map[string]interface{}) (*appleVerifyReceiptResponse, error) {
+		return &appleVerifyReceiptResponse{
+			Status:      0,
+			Environment: "Sandbox",
+			LatestReceiptInfo: []appleReceiptItem{
+				{
+					ProductID:             "com.guoliang.starmeet.weekly",
+					OriginalTransactionID: "txn-weekly-trial",
+					TransactionID:         "txn-weekly-trial-1",
+					ExpiresDateMs:         fmt.Sprintf("%d", trialEnd.UnixMilli()),
+				},
+			},
+		}, nil
+	}
+
+	verification, err := service.VerifyAppleReceipt("dGVzdA==", "weekly", true)
+	if err != nil {
+		t.Fatalf("verify weekly trial receipt: %v", err)
+	}
+	if verification.OriginalTransactionID != "txn-weekly-trial" {
+		t.Fatalf("unexpected transaction id: %q", verification.OriginalTransactionID)
+	}
+	if diff := verification.ExpiresAt.Sub(trialEnd); diff < -time.Second || diff > time.Second {
+		t.Fatalf("expected expiry to match trial end, got %v want %v", verification.ExpiresAt, trialEnd)
+	}
+
+	user := database.User{UserID: "user-weekly-trial", Nickname: "周卡试用用户", MemberLevel: "free"}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	subscription, err := service.CreateSubscription("user-weekly-trial", "weekly", verification.Environment, verification.OriginalTransactionID, verification.ExpiresAt)
+	if err != nil {
+		t.Fatalf("create weekly subscription: %v", err)
+	}
+	if subscription.PlanID != "weekly" || subscription.Status != "active" {
+		t.Fatalf("unexpected subscription: %+v", subscription)
+	}
+
+	var storedUser database.User
+	if err := db.Where("user_id = ?", "user-weekly-trial").First(&storedUser).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if storedUser.MemberLevel != "weekly" {
+		t.Fatalf("expected member level weekly, got %q", storedUser.MemberLevel)
+	}
+	if storedUser.MemberExpire == nil {
+		t.Fatal("expected member expire to be set")
+	}
+	if diff := storedUser.MemberExpire.Sub(trialEnd); diff < -time.Second || diff > time.Second {
+		t.Fatalf("expected member expire at trial end, got %v want %v", storedUser.MemberExpire, trialEnd)
+	}
+}
+
+func createSubscriptionTestUser(t *testing.T, db *gorm.DB, userID string) {
+	t.Helper()
+	if err := db.Create(&database.User{UserID: userID, Email: userID + "@example.test"}).Error; err != nil {
+		t.Fatalf("create user %s: %v", userID, err)
+	}
+}
+
+func TestCreateSubscriptionRejectsTransactionOwnedByAnotherUser(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	createSubscriptionTestUser(t, db, "owner")
+	createSubscriptionTestUser(t, db, "other")
+	expiry := time.Now().Add(30 * 24 * time.Hour)
+
+	if _, err := service.CreateSubscription("owner", "monthly", "Sandbox", "shared-original", expiry); err != nil {
+		t.Fatalf("create owner subscription: %v", err)
+	}
+	_, err := service.CreateSubscription("other", "monthly", "Sandbox", "shared-original", expiry)
+	if !errors.Is(err, ErrAppleTransactionConflict) {
+		t.Fatalf("expected ownership conflict, got %v", err)
+	}
+
+	var otherSubscriptions int64
+	if err := db.Model(&database.Subscription{}).Where("user_id = ?", "other").Count(&otherSubscriptions).Error; err != nil {
+		t.Fatal(err)
+	}
+	if otherSubscriptions != 0 {
+		t.Fatalf("conflicting claim created %d subscriptions", otherSubscriptions)
+	}
+	var other database.User
+	if err := db.Where("user_id = ?", "other").First(&other).Error; err != nil {
+		t.Fatal(err)
+	}
+	if other.MemberLevel != "free" || other.MemberExpire != nil {
+		t.Fatalf("conflicting claim changed entitlement: %+v", other)
+	}
+}
+
+func TestCreateSubscriptionInheritsUniqueHistoricalOwner(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	createSubscriptionTestUser(t, db, "legacy-owner")
+	createSubscriptionTestUser(t, db, "legacy-other")
+	expiry := time.Now().Add(20 * 24 * time.Hour)
+	if err := db.Create(&database.Subscription{
+		UserID:                     "legacy-owner",
+		PlanID:                     "monthly",
+		EndTime:                    expiry,
+		Status:                     "active",
+		Environment:                "Sandbox",
+		AppleOriginalTransactionID: "historical-original",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.CreateSubscription("legacy-owner", "monthly", "Sandbox", "historical-original", expiry); err != nil {
+		t.Fatalf("unique historical owner could not inherit: %v", err)
+	}
+	var owner database.AppleTransactionOwner
+	if err := db.Where("environment = ? AND original_transaction_id = ?", "Sandbox", "historical-original").First(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	if owner.UserID != "legacy-owner" {
+		t.Fatalf("unexpected inherited owner: %+v", owner)
+	}
+
+	if _, err := service.CreateSubscription("legacy-other", "monthly", "Sandbox", "historical-original", expiry); !errors.Is(err, ErrAppleTransactionConflict) {
+		t.Fatalf("other user claimed an inherited transaction: %v", err)
+	}
+}
+
+func TestCreateSubscriptionRejectsAmbiguousHistoricalTransaction(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	createSubscriptionTestUser(t, db, "ambig-a")
+	createSubscriptionTestUser(t, db, "ambig-b")
+	createSubscriptionTestUser(t, db, "ambig-c")
+	expiry := time.Now().Add(20 * 24 * time.Hour)
+	for index, userID := range []string{"ambig-a", "ambig-b"} {
+		environment := "Sandbox"
+		if index == 1 {
+			// Older rows may predate the environment column; they still belong
+			// to the same original transaction for ownership purposes.
+			environment = ""
+		}
+		if err := db.Create(&database.Subscription{
+			UserID:                     userID,
+			PlanID:                     "monthly",
+			EndTime:                    expiry,
+			Status:                     "active",
+			Environment:                environment,
+			AppleOriginalTransactionID: "ambiguous-original",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, userID := range []string{"ambig-a", "ambig-c"} {
+		if _, err := service.CreateSubscription(userID, "monthly", "Sandbox", "ambiguous-original", expiry); !errors.Is(err, ErrAppleTransactionConflict) {
+			t.Fatalf("%s received ambiguous ownership: %v", userID, err)
+		}
+	}
+	var owners int64
+	if err := db.Model(&database.AppleTransactionOwner{}).
+		Where("environment = ? AND original_transaction_id = ?", "Sandbox", "ambiguous-original").
+		Count(&owners).Error; err != nil {
+		t.Fatal(err)
+	}
+	if owners != 0 {
+		t.Fatalf("ambiguous transaction was assigned to %d owners", owners)
+	}
+}
+
+func TestCreateSubscriptionAllowsSameOwnerPlanChangeWithoutResettingExpiry(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	createSubscriptionTestUser(t, db, "upgrade-owner")
+	firstExpiry := time.Now().Add(10 * 24 * time.Hour)
+	upgradeExpiry := time.Now().Add(60 * 24 * time.Hour)
+
+	first, err := service.CreateSubscription("upgrade-owner", "monthly", "Sandbox", "upgrade-original", firstExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := service.CreateSubscription("upgrade-owner", "yearly", "Sandbox", "upgrade-original", upgradeExpiry)
+	if err != nil {
+		t.Fatalf("same owner could not change plan: %v", err)
+	}
+	if upgraded.ID == first.ID || upgraded.PlanID != "yearly" {
+		t.Fatalf("unexpected upgraded subscription: %+v", upgraded)
+	}
+	if diff := upgraded.EndTime.Sub(upgradeExpiry); diff < -time.Second || diff > time.Second {
+		t.Fatalf("upgrade did not keep the verified expiry: got %v want %v", upgraded.EndTime, upgradeExpiry)
+	}
+
+	repeated, err := service.CreateSubscription("upgrade-owner", "yearly", "Sandbox", "upgrade-original", upgradeExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated.ID != upgraded.ID {
+		t.Fatalf("repeated upgrade created a new subscription: %d and %d", upgraded.ID, repeated.ID)
+	}
+	if _, err := service.CreateSubscription("upgrade-owner", "monthly", "Sandbox", "upgrade-original", firstExpiry); !errors.Is(err, ErrAppleSubscriptionSuperseded) {
+		t.Fatalf("expected replaying the superseded plan to fail with stale purchase, got %v", err)
+	}
+	var owner database.User
+	if err := db.Where("user_id = ?", "upgrade-owner").First(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	if owner.MemberLevel != "yearly" || owner.MemberExpire == nil || !owner.MemberExpire.Equal(upgradeExpiry) {
+		t.Fatalf("replayed superseded receipt reset entitlement: %+v", owner)
+	}
+	active, err := service.GetActiveSubscription("upgrade-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID != upgraded.ID {
+		t.Fatalf("replayed superseded receipt replaced the active plan: %+v", active)
+	}
+	var subscriptions int64
+	if err := db.Model(&database.Subscription{}).Where("user_id = ?", "upgrade-owner").Count(&subscriptions).Error; err != nil {
+		t.Fatal(err)
+	}
+	if subscriptions != 2 {
+		t.Fatalf("expected one replaced and one active subscription, got %d", subscriptions)
+	}
+}
+
+func TestCreateSubscriptionClaimsTransactionOnceUnderConcurrentRequests(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	service := NewSubscriptionService(db)
+	users := []string{"race-a", "race-b", "race-c"}
+	for _, userID := range users {
+		createSubscriptionTestUser(t, db, userID)
+	}
+	expiry := time.Now().Add(30 * 24 * time.Hour)
+
+	var wg sync.WaitGroup
+	results := make([]error, len(users))
+	for index, userID := range users {
+		wg.Add(1)
+		go func(index int, userID string) {
+			defer wg.Done()
+			_, results[index] = service.CreateSubscription(userID, "monthly", "Sandbox", "race-original", expiry)
+		}(index, userID)
+	}
+	wg.Wait()
+
+	successes := 0
+	conflicts := 0
+	for _, result := range results {
+		switch {
+		case result == nil:
+			successes++
+		case errors.Is(result, ErrAppleTransactionConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected concurrent result: %v", result)
+		}
+	}
+	if successes != 1 || conflicts != len(users)-1 {
+		t.Fatalf("expected one winner and %d conflicts, got %d successes and %d conflicts", len(users)-1, successes, conflicts)
+	}
+	var owners int64
+	if err := db.Model(&database.AppleTransactionOwner{}).
+		Where("environment = ? AND original_transaction_id = ?", "Sandbox", "race-original").
+		Count(&owners).Error; err != nil {
+		t.Fatal(err)
+	}
+	if owners != 1 {
+		t.Fatalf("expected exactly one ownership row, got %d", owners)
+	}
+}
+
+func TestVerificationForJWSTransactionRejectsMissingOriginalAndRevocation(t *testing.T) {
+	plan := &database.Plan{Level: "monthly", AppleProductID: "com.guoliang.starmeet.monthly"}
+	now := time.Now()
+	payload := &jwsTransactionPayload{
+		OriginalTransactionID: "signed-original",
+		Environment:           "Sandbox",
+		Type:                  "Auto-Renewable Subscription",
+		ExpiresDate:           now.Add(time.Hour).UnixMilli(),
+		AppAccountToken:       "00000000-0000-4000-8000-000000000001",
+	}
+	verification, err := verificationForJWSTransaction(payload, plan, now)
+	if err != nil {
+		t.Fatalf("valid JWS payload failed: %v", err)
+	}
+	if verification.AppAccountToken != payload.AppAccountToken {
+		t.Fatalf("app account token was not carried: %+v", verification)
+	}
+
+	payload.OriginalTransactionID = ""
+	if _, err := verificationForJWSTransaction(payload, plan, now); err == nil {
+		t.Fatal("expected empty original transaction id to fail")
+	}
+
+	payload.OriginalTransactionID = "signed-original"
+	payload.RevocationDate = now.UnixMilli()
+	if _, err := verificationForJWSTransaction(payload, plan, now); !errors.Is(err, ErrAppleReceiptRevoked) {
+		t.Fatalf("expected revoked transaction to fail, got %v", err)
+	}
+
+	payload.RevocationDate = 0
+	payload.Type = "Consumable"
+	if _, err := verificationForJWSTransaction(payload, plan, now); err == nil {
+		t.Fatal("expected consumable transaction to fail")
+	}
+
+	payload.Type = "Auto-Renewable Subscription"
+	payload.Environment = "Xcode"
+	if _, err := verificationForJWSTransaction(payload, plan, now); err == nil {
+		t.Fatal("expected Xcode environment to fail")
+	}
+}
+
+func TestVerifyAppleReceiptCarriesAppAccountToken(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	original := appleVerifyReceiptRequestFunc
+	defer func() { appleVerifyReceiptRequestFunc = original }()
+	appleVerifyReceiptRequestFunc = func(url string, payload map[string]interface{}) (*appleVerifyReceiptResponse, error) {
+		return &appleVerifyReceiptResponse{
+			Status:      0,
+			Environment: "Sandbox",
+			LatestReceiptInfo: []appleReceiptItem{{
+				ProductID:             "com.guoliang.starmeet.monthly",
+				OriginalTransactionID: "token-original",
+				ExpiresDateMs:         futureAppleExpiry(),
+				AppAccountToken:       "00000000-0000-4000-8000-000000000001",
+			}},
+		}, nil
+	}
+
+	verification, err := service.VerifyAppleReceipt("dGVzdA==", "monthly", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verification.AppAccountToken != "00000000-0000-4000-8000-000000000001" {
+		t.Fatalf("app account token was not extracted: %+v", verification)
+	}
+}
+
+func TestVerifyAppleReceiptRejectsXcodeEnvironment(t *testing.T) {
+	db := setupSubscriptionServiceTestDB(t)
+	service := NewSubscriptionService(db)
+	original := appleVerifyReceiptRequestFunc
+	defer func() { appleVerifyReceiptRequestFunc = original }()
+	appleVerifyReceiptRequestFunc = func(url string, payload map[string]interface{}) (*appleVerifyReceiptResponse, error) {
+		return &appleVerifyReceiptResponse{
+			Status:      0,
+			Environment: "Xcode",
+			LatestReceiptInfo: []appleReceiptItem{{
+				ProductID:             "com.guoliang.starmeet.monthly",
+				OriginalTransactionID: "xcode-original",
+				ExpiresDateMs:         futureAppleExpiry(),
+			}},
+		}, nil
+	}
+
+	if _, err := service.VerifyAppleReceipt("dGVzdA==", "monthly", true); err == nil {
+		t.Fatal("expected Xcode receipt environment to fail")
 	}
 }

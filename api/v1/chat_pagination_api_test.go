@@ -28,7 +28,7 @@ func TestGetHistoryIncludesPaginationMetadata(t *testing.T) {
 		UserID:       "system_admin",
 		Name:         "历史分页角色",
 		Gender:       "female",
-		Relationship: "恋人",
+		Relationship: "伙伴",
 		IsPublic:     1,
 	}).Error; err != nil {
 		t.Fatalf("create character: %v", err)
@@ -96,7 +96,7 @@ func TestGetHistorySupportsBeforeIDCursorMetadata(t *testing.T) {
 		UserID:       "system_admin",
 		Name:         "历史游标角色",
 		Gender:       "female",
-		Relationship: "恋人",
+		Relationship: "伙伴",
 		IsPublic:     1,
 	}).Error; err != nil {
 		t.Fatalf("create character: %v", err)
@@ -223,7 +223,7 @@ func TestGetSessionsIncludesPaginationMetadata(t *testing.T) {
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("会话角色 %d", i),
 			Gender:       "female",
-			Relationship: "恋人",
+			Relationship: "伙伴",
 			IsPublic:     1,
 		}).Error; err != nil {
 			t.Fatalf("create character %d: %v", i, err)

@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"star-meet-backend/core/oss"
 	"star-meet-backend/model/request"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/logger"
 	"star-meet-backend/service"
 
 	"github.com/gin-gonic/gin"
@@ -46,6 +47,18 @@ func (a *UserAPI) Register(c *gin.Context) {
 		if errors.Is(err, service.ErrEmailRegistered) {
 			response.FailWithError(c, http.StatusConflict, "email already registered", "email_already_registered", gin.H{
 				"field": "email",
+			})
+			return
+		}
+		if errors.Is(err, service.ErrVerifyCodeExpired) {
+			response.FailWithError(c, http.StatusBadRequest, "verify code expired", "verify_code_expired", gin.H{
+				"field": "code",
+			})
+			return
+		}
+		if errors.Is(err, service.ErrInvalidVerifyCode) {
+			response.FailWithError(c, http.StatusBadRequest, "invalid verify code", "invalid_verify_code", gin.H{
+				"field": "code",
 			})
 			return
 		}
@@ -105,7 +118,15 @@ func (a *UserAPI) WechatLogin(c *gin.Context) {
 
 	result, err := a.UserService.WechatLogin(req)
 	if err != nil {
-		response.FailWithMessage(c, err.Error())
+		if errors.Is(err, service.ErrThirdPartyUnavailable) {
+			response.FailWithError(c, http.StatusServiceUnavailable, "微信登录服务暂不可用", "third_party_login_unavailable", nil)
+			return
+		}
+		if errors.Is(err, service.ErrDatabaseOperation) {
+			response.FailWithError(c, http.StatusInternalServerError, "服务器内部错误，请稍后重试", "database_error", nil)
+			return
+		}
+		response.FailWithError(c, http.StatusUnauthorized, "微信登录验证失败", "invalid_third_party_token", nil)
 		return
 	}
 
@@ -129,11 +150,79 @@ func (a *UserAPI) AppleLogin(c *gin.Context) {
 
 	result, err := a.UserService.AppleLogin(req)
 	if err != nil {
-		response.FailWithMessage(c, err.Error())
+		if errors.Is(err, service.ErrThirdPartyUnavailable) {
+			response.FailWithError(c, http.StatusServiceUnavailable, "Apple 登录服务暂不可用", "third_party_login_unavailable", nil)
+			return
+		}
+		if errors.Is(err, service.ErrDatabaseOperation) {
+			response.FailWithError(c, http.StatusInternalServerError, "服务器内部错误，请稍后重试", "database_error", nil)
+			return
+		}
+		response.FailWithError(c, http.StatusUnauthorized, "Apple 登录验证失败", "invalid_third_party_token", nil)
 		return
 	}
 
 	response.OkWithData(c, result)
+}
+
+// @Summary LINE 登录
+// @Tags 用户模块
+// @Accept json
+// @Produce json
+// @Param data body request.LineLoginReq true "请求参数"
+// @Success 200 {object} response.LoginResp
+// @Router /api/v1/user/line-login [post]
+func (a *UserAPI) LineLogin(c *gin.Context) {
+	var req request.LineLoginReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		failBindError(c, err, req)
+		return
+	}
+
+	result, err := a.UserService.LineLogin(req)
+	if err != nil {
+		if errors.Is(err, service.ErrThirdPartyUnavailable) {
+			response.FailWithError(c, http.StatusServiceUnavailable, "LINE 登录服务暂不可用", "third_party_login_unavailable", nil)
+			return
+		}
+		if errors.Is(err, service.ErrDatabaseOperation) {
+			response.FailWithError(c, http.StatusInternalServerError, "服务器内部错误，请稍后重试", "database_error", nil)
+			return
+		}
+		response.FailWithError(c, http.StatusUnauthorized, "LINE 登录验证失败", "invalid_third_party_token", nil)
+		return
+	}
+
+	response.OkWithData(c, result)
+}
+
+// DeleteAccount permanently deletes the authenticated user's account and data.
+func (a *UserAPI) DeleteAccount(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		failUnauthenticated(c)
+		return
+	}
+
+	var req request.DeleteAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		failBindError(c, err, req)
+		return
+	}
+	if strings.TrimSpace(req.Confirmation) != "DELETE" {
+		response.FailWithError(c, http.StatusUnprocessableEntity, "请确认输入 DELETE 以永久删除账号", "account_delete_confirmation_required", gin.H{"field": "confirmation"})
+		return
+	}
+	if err := a.UserService.DeleteAccount(userID); err != nil {
+		if errors.Is(err, service.ErrUserNotFound) {
+			failUnauthenticated(c)
+			return
+		}
+		logger.Errorf("delete account failed for user %s: %v", userID, err)
+		response.FailWithError(c, http.StatusInternalServerError, "账号删除失败，请稍后重试", "account_delete_failed", nil)
+		return
+	}
+	response.OkWithMessage(c, "账号已删除")
 }
 
 // GetUserInfo 获取用户信息
@@ -386,51 +475,22 @@ func (a *UserAPI) UploadAvatar(c *gin.Context) {
 		return
 	}
 
-	// 打开文件
-	src, err := file.Open()
+	buffer, ext, contentType, err := readImageUpload(file)
 	if err != nil {
-		response.FailWithMessage(c, "文件打开失败")
+		response.FailWithError(c, http.StatusUnprocessableEntity, imageSizeError(), "invalid_image", nil)
 		return
-	}
-	defer src.Close()
-
-	// 读取文件内容
-	buffer := make([]byte, file.Size)
-	_, err = src.Read(buffer)
-	if err != nil {
-		response.FailWithMessage(c, "文件读取失败")
-		return
-	}
-
-	// 生成唯一文件名
-	ext := "jpg"
-	if filename := file.Filename; filename != "" {
-		for _, e := range []string{".jpg", ".jpeg", ".png", ".gif"} {
-			if len(filename) > len(e) && filename[len(filename)-len(e):] == e {
-				ext = e[1:]
-				break
-			}
-		}
 	}
 	objectName := fmt.Sprintf("avatars/%s_%d.%s", userIDStr, time.Now().Unix(), ext)
 
-	// 尝试上传到OSS
-	avatarURL := "/uploads/avatar/" + objectName // 默认本地路径
-
 	ossClient, err := oss.NewOSSClient()
-	if err == nil {
-		// OSS上传成功
-		url, err := ossClient.Upload(objectName, buffer, "image/"+ext)
-		if err == nil {
-			avatarURL = url
-		}
+	if err != nil {
+		response.FailWithError(c, http.StatusServiceUnavailable, "头像上传服务暂不可用", "oss_not_configured", nil)
+		return
 	}
-
-	// 如果OSS失败，保存到本地
-	if avatarURL == "" || avatarURL[:1] == "/" {
-		localPath := "./uploads/avatar/" + objectName
-		os.MkdirAll("./uploads/avatar", 0755)
-		os.WriteFile(localPath, buffer, 0644)
+	avatarURL, err := ossClient.Upload(objectName, buffer, contentType)
+	if err != nil {
+		response.FailWithError(c, http.StatusBadGateway, "头像上传失败，请稍后重试", "oss_upload_failed", nil)
+		return
 	}
 
 	// 更新用户头像
@@ -462,7 +522,8 @@ func (a *UserAPI) SendVerifyCode(c *gin.Context) {
 		return
 	}
 
-	err := a.VerifyCodeService.SendVerifyCode(req.Email, req.Type)
+	lang := resolveLang(c)
+	err := a.VerifyCodeService.SendVerifyCode(req.Email, req.Type, lang)
 	if err != nil {
 		if errors.Is(err, service.ErrEmailRegistered) {
 			response.FailWithError(c, http.StatusConflict, "email already registered", "email_already_registered", gin.H{
@@ -472,6 +533,21 @@ func (a *UserAPI) SendVerifyCode(c *gin.Context) {
 		}
 		if errors.Is(err, service.ErrUserNotFound) {
 			response.FailWithError(c, http.StatusNotFound, "user not found", "user_not_found", gin.H{
+				"field": "email",
+			})
+			return
+		}
+		if errors.Is(err, service.ErrVerifyCodeLimitExceeded) {
+			var limitMsg string
+			switch lang {
+			case "zh-Hant":
+				limitMsg = "此信箱今日發送次數已達上限，請明天再試"
+			case "en":
+				limitMsg = "Daily limit reached for this email. Please try again tomorrow."
+			default:
+				limitMsg = "此邮箱今日发送次数已达上限，请明天再试"
+			}
+			response.FailWithError(c, http.StatusTooManyRequests, limitMsg, "verify_code_limit", gin.H{
 				"field": "email",
 			})
 			return

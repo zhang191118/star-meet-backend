@@ -27,6 +27,7 @@ func setupGachaDrawIdempotencyRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	}
 	if err := db.AutoMigrate(
 		&database.User{},
+		&database.Character{},
 		&database.GachaPool{},
 		&database.GachaCharacter{},
 		&database.UserGachaDraw{},
@@ -61,6 +62,15 @@ func setupGachaDrawIdempotencyRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	} {
 		if err := db.Create(&character).Error; err != nil {
 			t.Fatalf("create gacha character %s: %v", character.CharacterID, err)
+		}
+		if err := db.Create(&database.Character{
+			CharacterID: character.CharacterID,
+			UserID:      "system_admin",
+			Name:        character.CharacterID,
+			Gender:      "male",
+			IsPublic:    1,
+		}).Error; err != nil {
+			t.Fatalf("create public character %s: %v", character.CharacterID, err)
 		}
 	}
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
 	"star-meet-backend/service"
 
 	"github.com/gin-gonic/gin"
@@ -24,7 +25,8 @@ func (a *MobileAPI) GetHome(c *gin.Context) {
 		return
 	}
 
-	result, err := a.MobileService.GetHome(userID.(string))
+	lang := i18n.NormalizeLang(resolveLang(c))
+	result, err := a.MobileService.GetHome(userID.(string), lang)
 	if err != nil {
 		if errors.Is(err, service.ErrMobileUserNotFound) {
 			response.FailWithError(c, http.StatusNotFound, "user not found", "user_not_found", nil)
@@ -88,7 +90,8 @@ func (a *MobileAPI) PostBatch(c *gin.Context) {
 		return
 	}
 
-	result, err := a.MobileService.GetBatch(userID.(string), req)
+	lang := i18n.NormalizeLang(resolveLang(c))
+	result, err := a.MobileService.GetBatch(userID.(string), req, lang)
 	if err != nil {
 		if errors.Is(err, service.ErrMobileUserNotFound) {
 			response.FailWithError(c, http.StatusNotFound, "user not found", "user_not_found", nil)

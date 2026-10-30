@@ -27,8 +27,10 @@ func setupMobileServiceTestDB(t *testing.T) *gorm.DB {
 		&database.UserSettings{},
 		&database.Character{},
 		&database.Session{},
+		&database.Message{},
 		&database.UserCurrency{},
 		&database.Subscription{},
+		&database.Block{},
 	); err != nil {
 		t.Fatalf("migrate mobile tables: %v", err)
 	}
@@ -62,7 +64,7 @@ func TestMobileHomeAggregatesFirstScreenData(t *testing.T) {
 		CharacterID:  "char-recent",
 		UserID:       "system_admin",
 		Name:         "最近角色",
-		Gender:       "female",
+		Gender:       "male",
 		Relationship: "恋人",
 		IsPublic:     1,
 		ChatCount:    99,
@@ -73,7 +75,7 @@ func TestMobileHomeAggregatesFirstScreenData(t *testing.T) {
 		CharacterID:  "char-recommend",
 		UserID:       "system_admin",
 		Name:         "推荐角色",
-		Gender:       "female",
+		Gender:       "male",
 		Relationship: "朋友",
 		SystemPrompt: "首屏不应该暴露的人设提示词",
 		Mem0AgentID:  "mem0-secret-agent",
@@ -102,7 +104,7 @@ func TestMobileHomeAggregatesFirstScreenData(t *testing.T) {
 	}
 
 	service := &MobileService{DB: db}
-	home, err := service.GetHome("mobile-user")
+	home, err := service.GetHome("mobile-user", "en")
 	if err != nil {
 		t.Fatalf("get mobile home: %v", err)
 	}
@@ -163,7 +165,7 @@ func TestMobileHomeDegradesWalletWhenWalletLoadFails(t *testing.T) {
 		CharacterID:  "mobile-wallet-error-char",
 		UserID:       "system_admin",
 		Name:         "钱包异常推荐角色",
-		Gender:       "female",
+		Gender:       "male",
 		Relationship: "朋友",
 		IsPublic:     1,
 		ChatCount:    1,
@@ -175,7 +177,7 @@ func TestMobileHomeDegradesWalletWhenWalletLoadFails(t *testing.T) {
 	}
 
 	service := &MobileService{DB: db}
-	home, err := service.GetHome("mobile-wallet-error-user")
+	home, err := service.GetHome("mobile-wallet-error-user", "en")
 	if err != nil {
 		t.Fatalf("expected degraded mobile home instead of wallet error: %v", err)
 	}
@@ -279,7 +281,7 @@ func TestMobileHomeRecommendedCharactersUseStableTieBreakerOrdering(t *testing.T
 			CharacterID:  fmt.Sprintf("mobile-stable-char-%03d", i),
 			UserID:       "system_admin",
 			Name:         fmt.Sprintf("稳定推荐角色 %d", i),
-			Gender:       "female",
+			Gender:       "male",
 			Relationship: "恋人",
 			IsPublic:     1,
 			ChatCount:    77,
@@ -292,7 +294,7 @@ func TestMobileHomeRecommendedCharactersUseStableTieBreakerOrdering(t *testing.T
 	}
 
 	service := &MobileService{DB: db}
-	home, err := service.GetHome("mobile-stable-user")
+	home, err := service.GetHome("mobile-stable-user", "en")
 	if err != nil {
 		t.Fatalf("get mobile home: %v", err)
 	}
@@ -329,7 +331,7 @@ func TestMobileBatchAggregatesSafeCardsByInclude(t *testing.T) {
 			CharacterID:  "batch-service-char-a",
 			UserID:       "system_admin",
 			Name:         "批量服务角色A",
-			Gender:       "female",
+			Gender:       "male",
 			Relationship: "恋人",
 			SystemPrompt: "不能暴露的人设",
 			Mem0AgentID:  "secret-mem0",
@@ -364,7 +366,7 @@ func TestMobileBatchAggregatesSafeCardsByInclude(t *testing.T) {
 	batch, err := service.GetBatch("batch-service-user", MobileBatchReq{
 		CharacterIDs: []string{"batch-service-char-a", "batch-service-private", "batch-service-char-a", "batch-service-char-b"},
 		Include:      []string{"characters"},
-	})
+	}, "en")
 	if err != nil {
 		t.Fatalf("get mobile batch: %v", err)
 	}
@@ -395,7 +397,7 @@ func TestMobileBatchAggregatesSafeCardsByInclude(t *testing.T) {
 
 	defaultBatch, err := service.GetBatch("batch-service-user", MobileBatchReq{
 		CharacterIDs: []string{"batch-service-char-a"},
-	})
+	}, "en")
 	if err != nil {
 		t.Fatalf("get default mobile batch: %v", err)
 	}
@@ -422,7 +424,7 @@ func TestMobileBatchDegradesWalletWhenWalletLoadFails(t *testing.T) {
 			CharacterID:  "batch-wallet-error-char-a",
 			UserID:       "system_admin",
 			Name:         "批量钱包异常角色A",
-			Gender:       "female",
+			Gender:       "male",
 			Relationship: "恋人",
 			IsPublic:     1,
 			ChatCount:    10,
@@ -449,7 +451,7 @@ func TestMobileBatchDegradesWalletWhenWalletLoadFails(t *testing.T) {
 	batch, err := service.GetBatch("batch-wallet-error-user", MobileBatchReq{
 		CharacterIDs: []string{"batch-wallet-error-char-a", "batch-wallet-error-char-b"},
 		Include:      []string{"characters", "wallet", "membership"},
-	})
+	}, "en")
 	if err != nil {
 		t.Fatalf("expected degraded batch instead of wallet error: %v", err)
 	}
@@ -467,5 +469,54 @@ func TestMobileBatchDegradesWalletWhenWalletLoadFails(t *testing.T) {
 	}
 	if batch.Wallet[string(database.CurrencyStar)] != 0 || batch.Wallet[string(database.CurrencyMoon)] != 0 || batch.Wallet[string(database.CurrencySun)] != 0 {
 		t.Fatalf("expected zero fallback wallet, got %+v", batch.Wallet)
+	}
+}
+
+func TestMobileDashboardReadsChatQuotaFromRuntimeConfig(t *testing.T) {
+	db := setupMobileServiceTestDB(t)
+	if err := db.AutoMigrate(&database.RuntimeConfig{}); err != nil {
+		t.Fatalf("migrate runtime configs: %v", err)
+	}
+
+	if err := db.Create(&database.User{
+		UserID:      "quota-free-user",
+		Email:       "quota-free@example.com",
+		Nickname:    "额度免费用户",
+		MemberLevel: "free",
+	}).Error; err != nil {
+		t.Fatalf("create free user: %v", err)
+	}
+	if err := db.Create(&database.User{
+		UserID:      "quota-vip-user",
+		Email:       "quota-vip@example.com",
+		Nickname:    "额度会员用户",
+		MemberLevel: "monthly",
+	}).Error; err != nil {
+		t.Fatalf("create vip user: %v", err)
+	}
+
+	runtimeConfig := &RuntimeConfigService{DB: db}
+	if err := runtimeConfig.SeedDefaults(ChatQuotaRuntimeDefaults()); err != nil {
+		t.Fatalf("seed quota defaults: %v", err)
+	}
+	if _, err := runtimeConfig.Upsert(RuntimeConfigChatQuotaFreeDailyMessages, "12", false, ""); err != nil {
+		t.Fatalf("upsert daily messages: %v", err)
+	}
+
+	svc := &MobileService{DB: db, RuntimeConfig: runtimeConfig}
+	freeDashboard, err := svc.GetDashboard("quota-free-user")
+	if err != nil {
+		t.Fatalf("get free dashboard: %v", err)
+	}
+	if freeDashboard.DailyLimits.RemainingMessages != 12 || freeDashboard.DailyLimits.RemainingDraws != DefaultChatQuotaFreeDailyDraws {
+		t.Fatalf("unexpected free daily limits: %+v", freeDashboard.DailyLimits)
+	}
+
+	vipDashboard, err := svc.GetDashboard("quota-vip-user")
+	if err != nil {
+		t.Fatalf("get vip dashboard: %v", err)
+	}
+	if vipDashboard.DailyLimits.RemainingMessages != unlimitedRemainingMessages || vipDashboard.DailyLimits.FreeTrialRemaining != -1 {
+		t.Fatalf("unexpected vip daily limits: %+v", vipDashboard.DailyLimits)
 	}
 }

@@ -2,6 +2,7 @@ package deepseek
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +15,8 @@ const (
 )
 
 type Client struct {
-	APIKey  string
-	Client  *http.Client
+	APIKey string
+	Client *http.Client
 }
 
 type Message struct {
@@ -32,12 +33,12 @@ type GenerateRequest struct {
 }
 
 type GenerateResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Model   string `json:"model"`
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
-	Usage   Usage `json:"usage"`
+	Usage   Usage    `json:"usage"`
 }
 
 type Choice struct {
@@ -73,6 +74,10 @@ func NewClient(apiKey string) *Client {
 
 // Generate 调用DeepSeek API 生成回复
 func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (string, error) {
+	return c.GenerateContext(context.Background(), prompt, systemPrompt, maxTokens)
+}
+
+func (c *Client) GenerateContext(ctx context.Context, prompt string, systemPrompt string, maxTokens int) (string, error) {
 	if c.APIKey == "" {
 		return "", fmt.Errorf("deepseek api key not configured")
 	}
@@ -101,7 +106,10 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 
 	jsonBody, _ := json.Marshal(reqBody)
 
-	req, _ := http.NewRequest("POST", APIURL, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", APIURL, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 
@@ -116,12 +124,12 @@ func (c *Client) Generate(prompt string, systemPrompt string, maxTokens int) (st
 	// 检查是否有错误
 	var errResp ErrorResponse
 	if json.Unmarshal(respBody, &errResp); errResp.Error.Message != "" {
-		return "", fmt.Errorf("deepseek api error: %s", errResp.Error.Message)
+		return "", fmt.Errorf("deepseek provider returned an error")
 	}
 
 	var genResp GenerateResponse
 	if err := json.Unmarshal(respBody, &genResp); err != nil {
-		return "", fmt.Errorf("deepseek response parse error: %s, body: %s", err, string(respBody))
+		return "", fmt.Errorf("deepseek response parse error: %w", err)
 	}
 
 	if len(genResp.Choices) == 0 {

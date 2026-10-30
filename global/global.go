@@ -34,11 +34,19 @@ var (
 	KnowledgeService     *service.KnowledgeService
 	VerifyCodeService    *service.VerifyCodeService
 	RuntimeConfigService *service.RuntimeConfigService
+	NotificationService  *service.NotificationService
+	MomentService        *service.MomentService
+	MusicService         *service.MusicService
 )
 
 // NewRuntimeConfigService 创建运行时配置服务
 func NewRuntimeConfigService(db *gorm.DB) *service.RuntimeConfigService {
 	return &service.RuntimeConfigService{DB: db}
+}
+
+// NewNotificationService 创建通知服务
+func NewNotificationService(db *gorm.DB) *service.NotificationService {
+	return service.NewNotificationService(db)
 }
 
 // NewMem0Client 创建Mem0客户端
@@ -81,8 +89,13 @@ func NewQdrantClient(baseURL string) *qdrant.Client {
 }
 
 // NewUserService 创建用户服务
-func NewUserService(db *gorm.DB, verifyCodeService *service.VerifyCodeService) *service.UserService {
-	return &service.UserService{DB: db, VerifyCodeService: verifyCodeService}
+func NewUserService(db *gorm.DB, verifyCodeService *service.VerifyCodeService, mem0Client *mem0.Client, qdrantClient *qdrant.Client) *service.UserService {
+	return &service.UserService{
+		DB:                db,
+		VerifyCodeService: verifyCodeService,
+		Mem0Client:        mem0Client,
+		QdrantClient:      qdrantClient,
+	}
 }
 
 // NewKnowledgeService 创建知识库服务
@@ -97,12 +110,17 @@ func NewCharacterService(db *gorm.DB) *service.CharacterService {
 
 // NewMemoryService 创建记忆服务
 func NewMemoryService(db *gorm.DB, mem0Client *mem0.Client) *service.MemoryService {
-	return &service.MemoryService{DB: db, Mem0Client: mem0Client}
+	return &service.MemoryService{DB: db, Mem0Client: mem0Client, QdrantClient: QdrantClient, EmbeddingClient: EmbeddingClient}
+}
+
+// NewMomentService 创建角色动态服务
+func NewMomentService(db *gorm.DB) *service.MomentService {
+	return &service.MomentService{DB: db}
 }
 
 // NewMobileService 创建移动端聚合服务
 func NewMobileService(db *gorm.DB) *service.MobileService {
-	return service.NewMobileService(db)
+	return &service.MobileService{DB: db, RuntimeConfig: RuntimeConfigService}
 }
 
 // NewChatService 创建聊天服务

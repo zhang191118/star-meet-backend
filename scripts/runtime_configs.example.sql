@@ -26,7 +26,14 @@ VALUES
   ('deepseek.api_key', 'replace-with-deepseek-api-key', true, 'DeepSeek API key', NOW(), NOW()),
   ('gemini.api_key', 'replace-with-gemini-api-key', true, 'Gemini API key', NOW(), NOW()),
   ('gemini.model', 'gemini-2.0-flash', false, 'Gemini model name', NOW(), NOW()),
-  ('qdrant.host', 'http://localhost:6333', false, 'Qdrant endpoint', NOW(), NOW())
+  ('qdrant.host', '', false, 'Qdrant endpoint (empty = disabled, account deletion skips vector cleanup)', NOW(), NOW()),
+  ('chat.quota.enabled', 'true', false, '是否启用免费用户每日聊天条数限制', NOW(), NOW()),
+  ('chat.quota.free_daily_messages', '20', false, '免费用户每天可发送的用户消息条数（不含 AI 回复，台北时间 0 点重置）', NOW(), NOW()),
+  ('chat.quota.free_trial_messages', '0', false, '新用户额外试用条数，0 表示不启用单独试用池，只使用每日额度', NOW(), NOW()),
+  ('chat.quota.member_unlimited', 'true', false, '开通会员后是否不受每日聊天条数限制', NOW(), NOW()),
+  ('chat.quota.reset_timezone', 'Asia/Taipei', false, '每日聊天额度重置时区', NOW(), NOW()),
+  ('chat.quota.free_daily_draws', '3', false, '免费用户每日抽卡次数（占位，后续抽卡再接入）', NOW(), NOW()),
+  ('chat.quota.member_daily_draws', '20', false, '会员每日抽卡次数（占位，后续抽卡再接入）', NOW(), NOW())
 ON DUPLICATE KEY UPDATE
   `value` = VALUES(`value`),
   `sensitive` = VALUES(`sensitive`),

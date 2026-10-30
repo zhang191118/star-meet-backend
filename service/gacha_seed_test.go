@@ -38,6 +38,7 @@ func TestEnsureDefaultGachaContentSeedsDrawableStarterPool(t *testing.T) {
 		CharacterID: "seed-public-char",
 		UserID:      "system_admin",
 		Name:        "测试角色",
+		Gender:      "male",
 		IsPublic:    1,
 	}).Error; err != nil {
 		t.Fatalf("create public character: %v", err)
@@ -87,5 +88,31 @@ func TestEnsureDefaultGachaContentDoesNotCreatePoolWithoutPublicCharacters(t *te
 	}
 	if len(pools) != 0 {
 		t.Fatalf("expected no starter pool without public characters, got %#v", pools)
+	}
+}
+
+func TestEnsureDefaultGachaContentIgnoresPublicFemaleCharacters(t *testing.T) {
+	db := setupGachaSeedTestDB(t)
+	if err := db.Create(&database.Character{
+		CharacterID: "seed-public-female",
+		UserID:      "system_admin",
+		Name:        "女角色",
+		Gender:      "female",
+		IsPublic:    1,
+	}).Error; err != nil {
+		t.Fatalf("create public female character: %v", err)
+	}
+
+	gachaService := NewGachaService(db)
+	if err := gachaService.EnsureDefaultGachaContent(); err != nil {
+		t.Fatalf("ensure default gacha content: %v", err)
+	}
+
+	pools, err := gachaService.GetPools()
+	if err != nil {
+		t.Fatalf("get pools: %v", err)
+	}
+	if len(pools) != 0 {
+		t.Fatalf("expected no starter pool from female public characters, got %#v", pools)
 	}
 }

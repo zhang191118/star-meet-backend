@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -109,6 +110,7 @@ func CORS() gin.HandlerFunc {
 
 		if isAllowed {
 			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Vary", "Origin")
 		}
 
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
@@ -144,7 +146,12 @@ func allowedCORSOrigins() []string {
 }
 
 func isStarMeetSubdomain(origin string) bool {
-	return strings.HasSuffix(origin, ".starmeet.com")
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "starmeet.com" || strings.HasSuffix(host, ".starmeet.com")
 }
 
 // RateLimiter 限流中间件
@@ -195,5 +202,91 @@ func RateLimiter() gin.HandlerFunc {
 
 		mu.Unlock()
 		c.Next()
+	}
+}
+
+const (
+	chatGenerationWindow         = time.Minute
+	chatGenerationRequestsPerMin = 30
+	chatGenerationMinInterval    = 2 * time.Second
+)
+
+type chatGenerationCounter struct {
+	count       int
+	resetAt     time.Time
+	lastRequest time.Time
+}
+
+// ChatGenerationRateLimiter protects model-backed chat endpoints per account.
+// It intentionally has no daily quota: paid users can keep chatting normally,
+// while accidental duplicate requests and automated bursts are rejected.
+func ChatGenerationRateLimiter() gin.HandlerFunc {
+	return newChatGenerationRateLimiter(
+		chatGenerationRequestsPerMin,
+		chatGenerationMinInterval,
+		chatGenerationWindow,
+	)
+}
+
+func newChatGenerationRateLimiter(limit int, minInterval, window time.Duration) gin.HandlerFunc {
+	clients := make(map[string]*chatGenerationCounter)
+	var mu sync.Mutex
+	lastCleanup := time.Now()
+
+	return func(c *gin.Context) {
+		userID := c.GetString("user_id")
+		if userID == "" {
+			c.Next()
+			return
+		}
+
+		now := time.Now()
+		var retryAfter time.Duration
+
+		mu.Lock()
+		if now.Sub(lastCleanup) >= window {
+			for id, counter := range clients {
+				if now.After(counter.resetAt) {
+					delete(clients, id)
+				}
+			}
+			lastCleanup = now
+		}
+
+		counter := clients[userID]
+		if counter == nil || now.After(counter.resetAt) {
+			clients[userID] = &chatGenerationCounter{
+				count:       1,
+				resetAt:     now.Add(window),
+				lastRequest: now,
+			}
+			mu.Unlock()
+			c.Next()
+			return
+		}
+
+		if elapsed := now.Sub(counter.lastRequest); elapsed < minInterval {
+			retryAfter = minInterval - elapsed
+		} else if counter.count >= limit {
+			retryAfter = time.Until(counter.resetAt)
+		} else {
+			counter.count++
+			counter.lastRequest = now
+			mu.Unlock()
+			c.Next()
+			return
+		}
+		mu.Unlock()
+
+		seconds := int64(retryAfter.Seconds())
+		if retryAfter%time.Second != 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		c.Header("Retry-After", fmt.Sprintf("%d", seconds))
+		response.FailWithRetryAfter(c, http.StatusTooManyRequests, "请求过于频繁，请稍后再试", "rate_limited", seconds)
+		c.Abort()
 	}
 }

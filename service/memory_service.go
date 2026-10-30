@@ -1,271 +1,396 @@
 package service
 
 import (
-	"star-meet-backend/core/mem0"
-	"star-meet-backend/model/database"
-	"star-meet-backend/model/request"
-	"star-meet-backend/model/response"
+	"context"
+	"errors"
+	"sort"
+	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"star-meet-backend/core/embedding"
+	"star-meet-backend/core/mem0"
+	"star-meet-backend/core/qdrant"
+	"star-meet-backend/model/database"
+	"star-meet-backend/model/request"
+	"star-meet-backend/model/response"
+	"star-meet-backend/pkg/i18n"
 )
 
-type MemoryService struct {
-	DB         *gorm.DB
-	Mem0Client *mem0.Client
+var ErrInvalidMemory = errors.New("memory content must contain 1–2000 characters and a valid type")
+var ErrMemorySuperseded = errors.New("memory extraction superseded by user control")
+var memoryUserLocks [64]sync.Mutex
+
+func lockMemoryUser(userID string) func() {
+	var bucket uint32
+	for _, r := range userID {
+		bucket = bucket*31 + uint32(r)
+	}
+	mu := &memoryUserLocks[bucket%uint32(len(memoryUserLocks))]
+	mu.Lock()
+	return mu.Unlock
 }
 
-// GetMemoryList 获取记忆列表
+type MemoryService struct {
+	DB              *gorm.DB
+	Mem0Client      *mem0.Client
+	QdrantClient    *qdrant.Client
+	EmbeddingClient *embedding.Client
+}
+
+func (s *MemoryService) hasExternalIndex() bool { return s.Mem0Client != nil || s.QdrantClient != nil }
+func memoryResponse(mem database.Memory) response.MemoryResp {
+	state := "synced"
+	if mem.IndexedRevision < mem.Revision {
+		state = "pending"
+	}
+	return response.MemoryResp{MemoryID: mem.MemoryID, UserID: mem.UserID, CharacterID: mem.CharacterID,
+		Content: mem.Content, MemoryType: mem.MemoryType, Source: mem.Source, Importance: mem.Importance,
+		Revision: mem.Revision, SyncStatus: state, CreatedAt: mem.CreatedAt.Unix(), UpdatedAt: mem.UpdatedAt.Unix()}
+}
 func (s *MemoryService) GetMemoryList(req request.GetMemoryListReq) ([]response.MemoryResp, int64, error) {
-	if req.Page <= 0 {
-		req.Page = 1
-	}
-	if req.PageSize <= 0 {
-		req.PageSize = 20
-	}
-	req.PageSize = clampPageSize(req.PageSize)
-
-	query := s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ?", req.UserID, req.CharacterID)
-
-	// 类型筛选
-	if req.MemoryType != "" && req.MemoryType != "all" {
-		query = query.Where("memory_type = ?", req.MemoryType)
-	}
-
-	var total int64
-	query.Count(&total)
-
-	offset := (req.Page - 1) * req.PageSize
-	var memories []database.Memory
-	err := query.Order("created_at DESC, id DESC").Offset(offset).Limit(req.PageSize).Find(&memories).Error
-
+	resolvedCharacterID, err := s.resolveMemoryCharacterID(req.UserID, req.CharacterID)
 	if err != nil {
 		return nil, 0, err
 	}
-
-	resp := make([]response.MemoryResp, 0, len(memories))
-	for _, mem := range memories {
-		resp = append(resp, response.MemoryResp{
-			MemoryID:    mem.MemoryID,
-			UserID:      mem.UserID,
-			CharacterID: mem.CharacterID,
-			Content:     mem.Content,
-			MemoryType:  mem.MemoryType,
-			Source:      mem.Source,
-			Importance:  mem.Importance,
-			CreatedAt:   mem.CreatedAt.Unix(),
-			UpdatedAt:   mem.UpdatedAt.Unix(),
-		})
+	req.CharacterID = resolvedCharacterID
+	if req.Page < 1 {
+		req.Page = 1
 	}
-
-	// 如果Mem0可用，也从Mem0获取
-	if s.Mem0Client != nil {
-		memories, err := s.Mem0Client.GetAll(
-			"user_"+req.UserID,
-			"char_"+req.CharacterID,
-			req.PageSize,
-			offset,
-		)
-		if err == nil && len(memories) > 0 {
-			for _, m := range memories {
-				// 避免重复
-				exists := false
-				for _, r := range resp {
-					if r.Content == m.Memory {
-						exists = true
-						break
-					}
-				}
-				if !exists {
-					resp = append(resp, response.MemoryResp{
-						MemoryID:    m.ID,
-						UserID:      req.UserID,
-						CharacterID: req.CharacterID,
-						Content:     m.Memory,
-						MemoryType:  "chat",
-						Source:      "auto",
-						CreatedAt:   time.Now().Unix(),
-					})
-				}
-			}
+	if req.PageSize < 1 {
+		req.PageSize = 20
+	}
+	req.PageSize = clampPageSize(req.PageSize)
+	query := s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ?", req.UserID, req.CharacterID)
+	if req.MemoryType != "" && req.MemoryType != "all" {
+		query = query.Where("memory_type = ?", req.MemoryType)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var rows []database.Memory
+	if err := query.Order("created_at DESC, id DESC").Offset((req.Page - 1) * req.PageSize).Limit(req.PageSize).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	result := make([]response.MemoryResp, 0, len(rows))
+	for _, row := range rows {
+		resp := memoryResponse(row)
+		if !s.hasExternalIndex() {
+			resp.SyncStatus = "not_required"
 		}
+		result = append(result, resp)
 	}
-
-	return resp, total, nil
+	return result, total, nil
 }
-
-// AddMemory 添加记忆
 func (s *MemoryService) AddMemory(req request.AddMemoryReq) (*response.MemoryResp, error) {
-	memoryID := uuid.New().String()
-
-	// 先存入本地数据库
-	mem := database.Memory{
-		MemoryID:    memoryID,
-		UserID:      req.UserID,
-		CharacterID: req.CharacterID,
-		Content:     req.Content,
-		MemoryType:  req.MemoryType,
-		Source:      req.Source,
-	}
-
-	if mem.MemoryType == "" {
-		mem.MemoryType = "fact"
-	}
-	if mem.Source == "" {
-		mem.Source = "manual"
-	}
-
-	if err := s.DB.Create(&mem).Error; err != nil {
-		return nil, err
-	}
-
-	// 尝试存入Mem0
-	if s.Mem0Client != nil {
-		result, err := s.Mem0Client.Add(
-			"user_"+req.UserID,
-			"char_"+req.CharacterID,
-			req.Content,
-			map[string]interface{}{
-				"type":      req.MemoryType,
-				"source":    req.Source,
-				"memory_id": memoryID,
-				"timestamp": time.Now().Unix(),
-			},
-		)
-		if err == nil && result.ID != "" {
-			// 更新Mem0 ID
-			s.DB.Model(&mem).Update("mem0_id", result.ID)
-			mem.Mem0ID = result.ID
-		}
-	}
-
-	return &response.MemoryResp{
-		MemoryID:    mem.MemoryID,
-		UserID:      mem.UserID,
-		CharacterID: mem.CharacterID,
-		Content:     mem.Content,
-		MemoryType:  mem.MemoryType,
-		Source:      mem.Source,
-		Importance:  mem.Importance,
-		CreatedAt:   mem.CreatedAt.Unix(),
-		UpdatedAt:   mem.UpdatedAt.Unix(),
-	}, nil
-}
-
-// UpdateMemory 更新记忆
-func (s *MemoryService) UpdateMemory(memoryID, userID, content string) error {
-	// 更新本地
-	result := s.DB.Model(&database.Memory{}).Where("memory_id = ? AND user_id = ?", memoryID, userID).Update("content", content)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-
-	// 如果有Mem0 ID，也更新Mem0（Mem0不支持更新，需要删除后重新添加）
-	// 这里简化处理，只更新本地
-
-	return nil
-}
-
-// DeleteMemory 删除记忆
-func (s *MemoryService) DeleteMemory(memoryID, userID string) error {
-	// 获取记忆
-	var mem database.Memory
-	if err := s.DB.Where("memory_id = ? AND user_id = ?", memoryID, userID).First(&mem).Error; err != nil {
-		return err
-	}
-
-	// 删除Mem0中的记忆
-	if s.Mem0Client != nil && mem.Mem0ID != "" {
-		s.Mem0Client.Delete(mem.Mem0ID)
-	}
-
-	// 删除本地
-	return s.DB.Where("memory_id = ? AND user_id = ?", memoryID, userID).Delete(&database.Memory{}).Error
-}
-
-// SearchMemory 搜索记忆
-func (s *MemoryService) SearchMemory(req request.SearchMemoryReq) ([]response.MemoryResp, error) {
-	// 优先从Mem0搜索
-	if s.Mem0Client != nil {
-		results, err := s.Mem0Client.Search(
-			"user_"+req.UserID,
-			"char_"+req.CharacterID,
-			req.Query,
-			10,
-		)
-		if err == nil && len(results) > 0 {
-			var resp []response.MemoryResp
-			for _, r := range results {
-				resp = append(resp, response.MemoryResp{
-					MemoryID:    r.ID,
-					UserID:      req.UserID,
-					CharacterID: req.CharacterID,
-					Content:     r.Memory,
-					MemoryType:  "chat",
-					Source:      "auto",
-					CreatedAt:   time.Now().Unix(),
-				})
-			}
-			return resp, nil
-		}
-	}
-
-	// 降级到本地搜索
-	var memories []database.Memory
-	err := s.DB.Where("user_id = ? AND character_id = ? AND content LIKE ?",
-		req.UserID, req.CharacterID, "%"+req.Query+"%").
-		Limit(20).
-		Find(&memories).Error
-
+	resolvedCharacterID, err := s.resolveMemoryCharacterID(req.UserID, req.CharacterID)
 	if err != nil {
 		return nil, err
 	}
-
-	resp := make([]response.MemoryResp, 0, len(memories))
-	for _, mem := range memories {
-		resp = append(resp, response.MemoryResp{
-			MemoryID:    mem.MemoryID,
-			UserID:      mem.UserID,
-			CharacterID: mem.CharacterID,
-			Content:     mem.Content,
-			MemoryType:  mem.MemoryType,
-			Source:      mem.Source,
-			CreatedAt:   mem.CreatedAt.Unix(),
-		})
+	req.CharacterID = resolvedCharacterID
+	req.Content = strings.TrimSpace(req.Content)
+	if req.MemoryType == "" {
+		req.MemoryType = MemoryTypeFact
 	}
+	if req.Source == "" {
+		req.Source = "manual"
+	}
+	if utf8.RuneCountInString(req.Content) < 1 || utf8.RuneCountInString(req.Content) > 2000 {
+		return nil, ErrInvalidMemory
+	}
+	if _, ok := structuredMemoryTypes[req.MemoryType]; !ok {
+		return nil, ErrInvalidMemory
+	}
+	if req.Source != "auto" && req.Source != "manual" {
+		return nil, ErrInvalidMemory
+	}
+	if req.Importance < 1 || req.Importance > 5 {
+		req.Importance = 3
+	}
+	row := database.Memory{MemoryID: uuid.NewString(), UserID: req.UserID, CharacterID: req.CharacterID, Content: req.Content,
+		MemoryType: req.MemoryType, Source: req.Source, Importance: req.Importance, Revision: 1}
+	err = s.DB.Transaction(func(tx *gorm.DB) error {
+		// Serialize user-owned writes with account deletion using a short database row lock.
+		if err := requireExistingMemoryUser(tx, req.UserID); err != nil {
+			return err
+		}
 
-	return resp, nil
+		if req.Source == "auto" && !req.ObservedAt.IsZero() {
+			var controls int64
+			if err := tx.Unscoped().Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND updated_at >= ? AND (deleted_at IS NOT NULL OR source = ?)", req.UserID, req.CharacterID, req.ObservedAt, "manual").Count(&controls).Error; err != nil {
+				return err
+			}
+			if controls > 0 {
+				return ErrMemorySuperseded
+			}
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			return err
+		}
+		return s.queueIndex(tx, row, "")
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp := memoryResponse(row)
+	if !s.hasExternalIndex() {
+		resp.SyncStatus = "not_required"
+	}
+	return &resp, nil
+}
+func (s *MemoryService) queueIndex(tx *gorm.DB, row database.Memory, cleanupCharacterID string) error {
+	if !s.hasExternalIndex() {
+		// Preserve an existing cleanup job when a provider is temporarily disabled.
+		if !tx.Migrator().HasTable(&database.MemoryIndexJob{}) {
+			return nil
+		}
+		updates := map[string]interface{}{"revision": row.Revision, "character_id": row.CharacterID, "next_attempt_at": time.Now()}
+		if cleanupCharacterID != "" {
+			updates["cleanup_character_id"] = cleanupCharacterID
+		}
+		return tx.Model(&database.MemoryIndexJob{}).Where("memory_id = ?", row.MemoryID).Updates(updates).Error
+	}
+	job := database.MemoryIndexJob{MemoryID: row.MemoryID, UserID: row.UserID, CharacterID: row.CharacterID,
+		Revision: row.Revision, CleanupCharacterID: cleanupCharacterID, NextAttemptAt: time.Now()}
+	columns := []string{"user_id", "character_id", "revision", "attempts", "last_error", "next_attempt_at", "updated_at"}
+	if cleanupCharacterID != "" {
+		columns = append(columns, "cleanup_character_id")
+	}
+	return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "memory_id"}}, DoUpdates: clause.AssignmentColumns(columns)}).Create(&job).Error
+}
+func (s *MemoryService) UpdateMemory(memoryID, userID, content string) error {
+	content = strings.TrimSpace(content)
+	if utf8.RuneCountInString(content) < 1 || utf8.RuneCountInString(content) > 2000 {
+		return ErrInvalidMemory
+	}
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := requireExistingMemoryUser(tx, userID); err != nil {
+			return err
+		}
+		var row database.Memory
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("memory_id = ? AND user_id = ?", memoryID, userID).First(&row).Error; err != nil {
+			return err
+		}
+		row.Content = content
+		row.Source = "manual"
+		row.Revision++
+		if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		return s.queueIndex(tx, row, "")
+	})
+}
+func (s *MemoryService) DeleteMemory(memoryID, userID string) error {
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := requireExistingMemoryUser(tx, userID); err != nil {
+			return err
+		}
+		var row database.Memory
+		if err := tx.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).Where("memory_id = ? AND user_id = ?", memoryID, userID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.DeletedAt.Valid {
+			return s.queueIndex(tx, row, "")
+		}
+		row.Revision++
+		if err := tx.Save(&row).Error; err != nil {
+			return err
+		}
+		if err := tx.Delete(&row).Error; err != nil {
+			return err
+		}
+		if !s.hasExternalIndex() {
+			if err := tx.Unscoped().Model(&row).Update("content", "").Error; err != nil {
+				return err
+			}
+		}
+		return s.queueIndex(tx, row, "")
+	})
+}
+func (s *MemoryService) SearchMemory(req request.SearchMemoryReq) ([]response.MemoryResp, error) {
+	resolvedCharacterID, err := s.resolveMemoryCharacterID(req.UserID, req.CharacterID)
+	if err != nil {
+		return nil, err
+	}
+	req.CharacterID = resolvedCharacterID
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	rows, err := s.Retrieve(ctx, req.UserID, req.CharacterID, req.Query, 20)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]response.MemoryResp, 0, len(rows))
+	for _, row := range rows {
+		resp := memoryResponse(row)
+		if !s.hasExternalIndex() {
+			resp.SyncStatus = "not_required"
+		}
+		result = append(result, resp)
+	}
+	return result, nil
 }
 
-// GetMemoryStats 获取记忆统计
+// Retrieve uses current SQL rows only. Unknown, stale, foreign, or deleted external records cannot supply text.
+func (s *MemoryService) Retrieve(ctx context.Context, userID, characterID, query string, limit int) ([]database.Memory, error) {
+	var rows []database.Memory
+	if err := s.DB.WithContext(ctx).Where("user_id = ? AND character_id = ?", userID, characterID).
+		Order("source = 'manual' DESC, importance DESC, updated_at DESC, id DESC").Limit(100).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	candidates := map[string]database.Memory{}
+	semantic := map[string]float64{}
+	for _, row := range rows {
+		candidates[row.MemoryID] = row
+	}
+	if s.QdrantClient != nil && s.EmbeddingClient != nil && ctx.Err() == nil {
+		if vector, err := s.EmbeddingClient.GetEmbeddingContext(ctx, query); err == nil {
+			if points, err := s.QdrantClient.SearchContext(ctx, "memories", vector, 10, memorySearchFilter(userID, characterID)); err == nil {
+				ids := []string{}
+				for _, point := range points {
+					if id, ok := point.Payload["memory_id"].(string); ok && id != "" {
+						ids = append(ids, id)
+						semantic[id] = point.Score
+					}
+				}
+				if len(ids) > 0 {
+					var matched []database.Memory
+					if err := s.DB.WithContext(ctx).Where("user_id = ? AND character_id = ? AND memory_id IN ?", userID, characterID, ids).Find(&matched).Error; err == nil {
+						for _, row := range matched {
+							candidates[row.MemoryID] = row
+						}
+					}
+				}
+			}
+		}
+	}
+	// Mem0's legacy Search response does not carry a trusted canonical ID; map tracked external IDs through SQL.
+	if s.Mem0Client != nil && s.QdrantClient == nil && ctx.Err() == nil {
+		if results, err := s.Mem0Client.SearchContext(ctx, "user_"+userID, "char_"+characterID, query, 10); err == nil {
+			ids := []string{}
+			for _, point := range results {
+				ids = append(ids, point.ID)
+			}
+			if len(ids) > 0 {
+				var matched []database.Memory
+				if err := s.DB.WithContext(ctx).Where("user_id = ? AND character_id = ? AND mem0_id IN ?", userID, characterID, ids).Find(&matched).Error; err == nil {
+					for _, row := range matched {
+						candidates[row.MemoryID] = row
+						semantic[row.MemoryID] = 1
+					}
+				}
+			}
+		}
+	}
+	tokens := memoryQueryTokens(query)
+	score := func(row database.Memory) float64 {
+		value := float64(row.Importance)
+		if row.Source == "manual" {
+			value += 2
+		}
+		text := i18n.NormalizeDetectionText(row.Content)
+		for _, token := range tokens {
+			if strings.Contains(text, token) {
+				value += 4
+			}
+		}
+		return value + semantic[row.MemoryID]*8
+	}
+	result := make([]database.Memory, 0, len(candidates))
+	for _, row := range candidates {
+		result = append(result, row)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		a, b := score(result[i]), score(result[j])
+		if a != b {
+			return a > b
+		}
+		if !result[i].UpdatedAt.Equal(result[j].UpdatedAt) {
+			return result[i].UpdatedAt.After(result[j].UpdatedAt)
+		}
+		return result[i].ID > result[j].ID
+	})
+	if limit < 1 {
+		limit = 5
+	}
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+func memoryQueryTokens(text string) []string {
+	text = i18n.NormalizeDetectionText(text)
+	seen := map[string]bool{}
+	tokens := []string{}
+	add := func(s string) {
+		if utf8.RuneCountInString(s) > 1 && !seen[s] {
+			seen[s] = true
+			tokens = append(tokens, s)
+		}
+	}
+	for _, word := range strings.FieldsFunc(text, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsNumber(r) }) {
+		runes := []rune(word)
+		add(word)
+		for i := 1; i < len(runes); i++ {
+			if unicode.Is(unicode.Han, runes[i-1]) && unicode.Is(unicode.Han, runes[i]) {
+				add(string(runes[i-1 : i+1]))
+			}
+		}
+	}
+	return tokens
+}
 func (s *MemoryService) GetMemoryStats(userID, characterID string) (*response.MemoryStatsResp, error) {
-	resp := &response.MemoryStatsResp{}
+	resolvedCharacterID, err := s.resolveMemoryCharacterID(userID, characterID)
+	if err != nil {
+		return nil, err
+	}
+	characterID = resolvedCharacterID
+	var rows []database.Memory
+	if err := s.DB.Select("memory_type", "created_at").Where("user_id = ? AND character_id = ?", userID, characterID).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := &response.MemoryStatsResp{TotalCount: len(rows)}
+	today := time.Now().In(chatQuotaLocation("Asia/Taipei")).Format("2006-01-02")
+	for _, row := range rows {
+		if row.CreatedAt.In(chatQuotaLocation("Asia/Taipei")).Format("2006-01-02") == today {
+			result.TodayCount++
+		}
+		switch row.MemoryType {
+		case "preference":
+			result.PreferenceCnt++
+		case "emotion":
+			result.EmotionCnt++
+		case "event":
+			result.EventCnt++
+		case "relationship":
+			result.RelationshipCnt++
+		}
+	}
+	return result, nil
+}
 
-	var totalCount, todayCount, prefCnt, emoCnt, evtCnt, relCnt int64
+func (s *MemoryService) resolveMemoryCharacterID(userID, characterID string) (string, error) {
+	if !s.DB.Migrator().HasTable(&database.Character{}) {
+		return characterID, nil
+	}
+	resolvedID, err := canonicalCharacterIDForUser(s.DB, userID, characterID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Memory-only deployments and historical rows can outlive a character
+		// record. Preserve that scope; user_id still provides tenant isolation.
+		return characterID, nil
+	}
+	return resolvedID, err
+}
 
-	// 总数
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ?", userID, characterID).Count(&totalCount)
-
-	// 今日新增
-	today := time.Now().Format("2006-01-02")
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND DATE(created_at) = ?", userID, characterID, today).Count(&todayCount)
-
-	// 各类型数量
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND memory_type = ?", userID, characterID, "preference").Count(&prefCnt)
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND memory_type = ?", userID, characterID, "emotion").Count(&emoCnt)
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND memory_type = ?", userID, characterID, "event").Count(&evtCnt)
-	s.DB.Model(&database.Memory{}).Where("user_id = ? AND character_id = ? AND memory_type = ?", userID, characterID, "relationship").Count(&relCnt)
-
-	resp.TotalCount = int(totalCount)
-	resp.TodayCount = int(todayCount)
-	resp.PreferenceCnt = int(prefCnt)
-	resp.EmotionCnt = int(emoCnt)
-	resp.EventCnt = int(evtCnt)
-	resp.RelationshipCnt = int(relCnt)
-
-	return resp, nil
+func requireExistingMemoryUser(tx *gorm.DB, userID string) error {
+	if !tx.Migrator().HasTable(&database.User{}) {
+		return nil
+	}
+	var user database.User
+	return tx.Select("user_id").Clauses(clause.Locking{Strength: "UPDATE"}).Where("user_id = ?", userID).First(&user).Error
 }

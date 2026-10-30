@@ -32,9 +32,11 @@ func (a *SubscriptionAPI) GetPlans(c *gin.Context) {
 
 func (a *SubscriptionAPI) VerifyAppleReceipt(c *gin.Context) {
 	var req struct {
-		Receipt   string `json:"receipt" binding:"required"`
-		PlanID    string `json:"plan_id" binding:"required"`
-		IsSandbox bool   `json:"is_sandbox"`
+		Receipt       string `json:"receipt"`
+		PlanID        string `json:"plan_id" binding:"required"`
+		IsSandbox     bool   `json:"is_sandbox"`
+		TransactionID string `json:"transaction_id"`
+		JWS           string `json:"jws"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -48,8 +50,22 @@ func (a *SubscriptionAPI) VerifyAppleReceipt(c *gin.Context) {
 		return
 	}
 
-	verification, err := a.SubscriptionService.VerifyAppleReceipt(req.Receipt, req.PlanID, req.IsSandbox)
+	verification, err := a.SubscriptionService.ConfirmApplePurchase(service.ApplePurchaseConfirmation{
+		Receipt:       req.Receipt,
+		PlanID:        req.PlanID,
+		TransactionID: req.TransactionID,
+		JWS:           req.JWS,
+		IsSandbox:     req.IsSandbox,
+	})
 	if err != nil {
+		if errors.Is(err, service.ErrAppleReceiptRevoked) {
+			response.FailWithError(c, http.StatusBadRequest, "Invalid receipt: "+err.Error(), "apple_transaction_revoked", nil)
+			return
+		}
+		if errors.Is(err, service.ErrAppleJWSRejected) {
+			response.FailWithError(c, http.StatusBadRequest, "Invalid receipt: "+err.Error(), "apple_jws_rejected", nil)
+			return
+		}
 		if errors.Is(err, service.ErrInvalidReceiptFormat) {
 			response.FailWithError(c, http.StatusUnprocessableEntity, "validation failed", "validation_failed", gin.H{
 				"field":  "receipt",
@@ -61,8 +77,27 @@ func (a *SubscriptionAPI) VerifyAppleReceipt(c *gin.Context) {
 		return
 	}
 
-	sub, err := a.SubscriptionService.CreateSubscription(userID, req.PlanID, verification.Environment, verification.OriginalTransactionID)
+	if verification.AppAccountToken != "" && !service.AppleAccountTokenMatchesUser(verification.AppAccountToken, userID) {
+		response.FailWithError(c, http.StatusForbidden, "Apple transaction belongs to a different account", "apple_transaction_account_mismatch", nil)
+		return
+	}
+
+	sub, err := a.SubscriptionService.CreateSubscription(
+		userID,
+		req.PlanID,
+		verification.Environment,
+		verification.OriginalTransactionID,
+		verification.ExpiresAt,
+	)
 	if err != nil {
+		if errors.Is(err, service.ErrAppleTransactionConflict) {
+			response.FailWithError(c, http.StatusConflict, "Apple transaction is already linked to another account", "apple_transaction_conflict", nil)
+			return
+		}
+		if errors.Is(err, service.ErrAppleSubscriptionSuperseded) {
+			response.FailWithError(c, http.StatusConflict, "Apple subscription was superseded by a newer purchase", "stale_purchase", nil)
+			return
+		}
 		response.Fail(c, http.StatusInternalServerError, "Failed to create subscription: "+err.Error())
 		return
 	}

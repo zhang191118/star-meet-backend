@@ -2,13 +2,17 @@ package database
 
 import (
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type Message struct {
 	ID        uint       `json:"id" gorm:"primarykey;index:idx_messages_session_created_id,sort:desc,priority:3;index:idx_messages_user_character_created_id,sort:desc,priority:4"`
 	CreatedAt time.Time  `json:"created_at" gorm:"index:idx_messages_session_created_id,sort:desc,priority:2;index:idx_messages_user_character_created_id,sort:desc,priority:3"`
 	UpdatedAt time.Time  `json:"updated_at"`
-	DeletedAt *time.Time `json:"-" gorm:"index"`
+	// gorm.DeletedAt 让消息删除走软删除：配额统计（Unscoped）仍计入已删除消息，
+	// 避免通过删除消息绕过新用户免费条数限制。
+	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
 	MessageID   string `json:"message_id" gorm:"uniqueIndex;size:64;not null" json:"message_id"`
 	SessionID   string `json:"session_id" gorm:"index;index:idx_messages_session_created_id,priority:1;size:64;not null" json:"session_id"`
@@ -26,6 +30,9 @@ type Message struct {
 	// 情绪分析
 	UserEmotion  string `json:"user_emotion" gorm:"size:20" json:"user_emotion"`
 	ReplyEmotion string `json:"reply_emotion" gorm:"size:20" json:"reply_emotion"`
+
+	// 导演批注（面向客户端的"当前形势分析"，仅 assistant 消息）
+	DirectorNote string `json:"director_note" gorm:"type:text"`
 
 	// 已读状态
 	IsRead bool       `json:"is_read" gorm:"default:false" json:"is_read"`

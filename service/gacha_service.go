@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"star-meet-backend/model/database"
+	"star-meet-backend/pkg/i18n"
 
 	"gorm.io/gorm"
 )
 
 type GachaService struct {
-	DB *gorm.DB
+	DB           *gorm.DB
+	Notification *NotificationService
 }
 
 var ErrGachaIdempotencyConflict = errors.New("gacha idempotency conflict")
@@ -104,7 +106,7 @@ func defaultStarterGachaPool() database.GachaPool {
 func defaultGachaCandidateIDs(tx *gorm.DB) ([]string, error) {
 	var characters []database.Character
 	if err := tx.Select("character_id").
-		Where("is_public = ? AND character_id <> ?", 1, "").
+		Where("is_public = ? AND gender = ? AND character_id <> ?", 1, publicMarketplaceGender, "").
 		Order("chat_count DESC, created_at DESC, id DESC").
 		Limit(20).
 		Find(&characters).Error; err != nil {
@@ -128,7 +130,13 @@ func (s *GachaService) GetPool(poolID string) (*database.GachaPool, error) {
 
 func (s *GachaService) GetPoolCharacters(poolID string) ([]database.GachaCharacter, error) {
 	var characters []database.GachaCharacter
-	if err := s.DB.Where("pool_id = ?", poolID).Find(&characters).Error; err != nil {
+	err := s.DB.Model(&database.GachaCharacter{}).
+		Joins("JOIN characters ON characters.character_id = gacha_characters.character_id AND characters.deleted_at IS NULL").
+		Where("gacha_characters.pool_id = ?", poolID).
+		Where("characters.is_public = ? AND characters.gender = ?", 1, publicMarketplaceGender).
+		Select("gacha_characters.*").
+		Find(&characters).Error
+	if err != nil {
 		return nil, err
 	}
 	return characters, nil
@@ -391,6 +399,25 @@ func (s *GachaService) draw(userID, poolID string, count int, clientDrawID strin
 		return nil, err
 	}
 
+	if s.Notification != nil && len(results) > 0 {
+		best := results[0].Rarity
+		bestChar := results[0].CharacterID
+		for _, rec := range results {
+			if rarityRank(rec.Rarity) > rarityRank(best) {
+				best = rec.Rarity
+				bestChar = rec.CharacterID
+			}
+		}
+		if best == database.GachaSSR || best == database.GachaSR {
+			var ch database.Character
+			name := ""
+			if err := s.DB.Where("character_id = ?", bestChar).First(&ch).Error; err == nil {
+				name = i18n.TranslateCharacterName(ch.Name, "en")
+			}
+			s.Notification.NotifyNewCharacter(userID, name, "en", string(best))
+		}
+	}
+
 	return &DrawResult{
 		Records:    results,
 		Characters: obtainedCharacters,
@@ -441,4 +468,17 @@ func (s *GachaService) ToggleFavorite(userID, characterID string) error {
 
 	userChar.IsFavorite = !userChar.IsFavorite
 	return s.DB.Save(&userChar).Error
+}
+
+func rarityRank(r database.GachaRarity) int {
+	switch r {
+	case database.GachaSSR:
+		return 4
+	case database.GachaSR:
+		return 3
+	case database.GachaR:
+		return 2
+	default:
+		return 1
+	}
 }

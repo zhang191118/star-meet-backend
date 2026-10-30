@@ -18,9 +18,9 @@ type GachaAPI struct {
 }
 
 func NewGachaAPI() *GachaAPI {
-	return &GachaAPI{
-		GachaService: service.NewGachaService(global.GVA_DB),
-	}
+	svc := service.NewGachaService(global.GVA_DB)
+	svc.Notification = global.NotificationService
+	return &GachaAPI{GachaService: svc}
 }
 
 func (a *GachaAPI) GetPools(c *gin.Context) {

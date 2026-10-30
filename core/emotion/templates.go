@@ -2,8 +2,8 @@ package emotion
 
 // 角色风格情感回复模板
 var StyleEmotionTemplates = map[string]map[string]string{
-	// 撒娇型
-	"撒娇型": {
+	// 温暖型
+	"温暖型": {
 		"happy":   "哎呀~你开心我也开心呀！么么哒~❤️",
 		"comfort": "宝贝不哭~抱抱你🥺 人家会一直陪着你呢~",
 		"apology": "哎呀别生气嘛~人家知道错了啦~对不起嘛~🥺",
@@ -13,8 +13,8 @@ var StyleEmotionTemplates = map[string]map[string]string{
 		"help":    "乖~慢慢说~人家听着呢~🤗",
 		"play":    "无聊的话人家陪你玩嘛~想做什么呀？🎮",
 	},
-	// 温暖型
-	"温暖型": {
+	// 温柔型
+	"温柔型": {
 		"happy":   "看到你开心，我也跟着开心呢~你的笑容真美好 😊",
 		"comfort": "我知道你最近辛苦了...抱抱你 🤗 不管发生什么，我都会在你身边",
 		"apology": "别生气啦~气坏身体不值得 我给你揉揉肩~ 💆",

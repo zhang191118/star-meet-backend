@@ -9,6 +9,8 @@ import (
 )
 
 var ErrCurrencyIdempotencyConflict = errors.New("currency idempotency conflict")
+var ErrInvalidAppleCurrencyReceipt = errors.New("invalid apple currency receipt")
+var ErrAppleCurrencyReceiptAlreadyUsed = errors.New("apple currency receipt already used")
 
 type CurrencyService struct {
 	DB *gorm.DB
@@ -102,6 +104,17 @@ func (s *CurrencyService) AddCurrencyWithClientOrderID(userID string, currencyTy
 		return nil, false, err
 	}
 	return &result, idempotent, nil
+}
+
+// VerifyAppleReceiptAndRecharge preserves the receipt-only API used by older
+// clients. New clients should call ConfirmAppleCurrencyPurchase with the exact
+// StoreKit transaction ID.
+func (s *CurrencyService) VerifyAppleReceiptAndRecharge(userID, packageID, receipt string, isSandbox bool) (map[database.CurrencyType]int64, bool, error) {
+	return s.ConfirmAppleCurrencyPurchase(userID, AppleCurrencyPurchaseConfirmation{
+		Receipt:   receipt,
+		PackageID: packageID,
+		IsSandbox: isSandbox,
+	})
 }
 
 func addCurrencyInTx(tx *gorm.DB, userID string, currencyType database.CurrencyType, amount int64, txType database.TransactionType, relatedID, description string, clientOrderID *string) (*database.CurrencyTransaction, error) {

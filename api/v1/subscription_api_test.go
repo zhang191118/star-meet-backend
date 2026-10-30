@@ -3,11 +3,13 @@ package v1_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	apiv1 "star-meet-backend/api/v1"
 	"star-meet-backend/middleware"
@@ -34,7 +36,7 @@ func setupSubscriptionAPITestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("open sqlite: %v", err)
 	}
 
-	if err := db.AutoMigrate(&database.User{}, &database.Plan{}, &database.Subscription{}); err != nil {
+	if err := db.AutoMigrate(&database.User{}, &database.Plan{}, &database.Subscription{}, &database.AppleTransactionOwner{}); err != nil {
 		t.Fatalf("migrate tables: %v", err)
 	}
 
@@ -92,7 +94,7 @@ func TestVerifyAppleReceiptCreatesSubscriptionForJWTUser(t *testing.T) {
 	oldTransport := http.DefaultTransport
 	defer func() { http.DefaultTransport = oldTransport }()
 	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		body := `{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.starmeet.monthly","original_transaction_id":"txn-owner","transaction_id":"txn-owner-1","expires_date_ms":"100"}]}`
+		body := `{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.guoliang.starmeet.monthly","original_transaction_id":"txn-owner","transaction_id":"txn-owner-1","expires_date_ms":"4102444800000"}]}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -199,6 +201,195 @@ func TestVerifyAppleReceiptRequiresAuthBeforeAppleRequest(t *testing.T) {
 	}
 	if resp.RequestID != "subscription-apple-auth-first-req" {
 		t.Fatalf("expected request_id to be preserved, got %q", resp.RequestID)
+	}
+}
+
+func newSubscriptionVerifyRouter(api *apiv1.SubscriptionAPI) *gin.Engine {
+	router := gin.New()
+	group := router.Group("/api/v1/subscription")
+	group.Use(middleware.Auth())
+	group.POST("/apple/verify", api.VerifyAppleReceipt)
+	return router
+}
+
+func postSubscriptionReceipt(t *testing.T, router *gin.Engine, userID, receiptBody string) *httptest.ResponseRecorder {
+	t.Helper()
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(receiptBody)),
+			Request:    req,
+		}, nil
+	})
+
+	payload, err := json.Marshal(map[string]interface{}{
+		"receipt":    "dGVzdA==",
+		"plan_id":    "monthly",
+		"is_sandbox": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/subscription/apple/verify", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+makeTestToken(t, userID))
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func TestVerifyAppleReceiptReturnsStableConflictWithoutOwnerID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupSubscriptionAPITestDB(t)
+	for _, userID := range []string{"owner", "other"} {
+		if err := db.Create(&database.User{UserID: userID, Email: userID + "-conflict@example.com"}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&database.AppleTransactionOwner{
+		Environment:           "Sandbox",
+		OriginalTransactionID: "api-owned-original",
+		UserID:                "other",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiv1.SubscriptionAPI{SubscriptionService: service.NewSubscriptionService(db)}
+	recorder := postSubscriptionReceipt(t, newSubscriptionVerifyRouter(api), "owner",
+		`{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.guoliang.starmeet.monthly","original_transaction_id":"api-owned-original","transaction_id":"api-owned-1","expires_date_ms":"4102444800000"}]}`)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"other"`) {
+		t.Fatalf("conflict response leaked the owner id: %s", recorder.Body.String())
+	}
+	var resp response.Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ErrorCode != "apple_transaction_conflict" {
+		t.Fatalf("unexpected error code: %+v", resp)
+	}
+	var count int64
+	if err := db.Model(&database.Subscription{}).Where("user_id = ?", "owner").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("conflicting request created %d subscriptions", count)
+	}
+}
+
+func TestVerifyAppleReceiptRejectsMismatchedAppAccountToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupSubscriptionAPITestDB(t)
+	userID := "11111111-1111-4111-8111-111111111111"
+	if err := db.Create(&database.User{UserID: userID, Email: "token-mismatch@example.com"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiv1.SubscriptionAPI{SubscriptionService: service.NewSubscriptionService(db)}
+	recorder := postSubscriptionReceipt(t, newSubscriptionVerifyRouter(api), userID,
+		`{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.guoliang.starmeet.monthly","original_transaction_id":"token-mismatch-original","transaction_id":"token-mismatch-1","expires_date_ms":"4102444800000","app_account_token":"22222222-2222-4222-8222-222222222222"}]}`)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp response.Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ErrorCode != "apple_transaction_account_mismatch" {
+		t.Fatalf("unexpected error code: %+v", resp)
+	}
+	var count int64
+	if err := db.Model(&database.Subscription{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("mismatched app account token created %d subscriptions", count)
+	}
+}
+
+func TestVerifyAppleReceiptAcceptsMatchingAppAccountToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupSubscriptionAPITestDB(t)
+	userID := "33333333-3333-4333-8333-333333333333"
+	if err := db.Create(&database.User{UserID: userID, Email: "token-match@example.com"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiv1.SubscriptionAPI{SubscriptionService: service.NewSubscriptionService(db)}
+	recorder := postSubscriptionReceipt(t, newSubscriptionVerifyRouter(api), userID,
+		`{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.guoliang.starmeet.monthly","original_transaction_id":"token-match-original","transaction_id":"token-match-1","expires_date_ms":"4102444800000","app_account_token":"33333333-3333-4333-8333-333333333333"}]}`)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var subscription database.Subscription
+	if err := db.Where("user_id = ?", userID).First(&subscription).Error; err != nil {
+		t.Fatal(err)
+	}
+	if subscription.AppleOriginalTransactionID != "token-match-original" {
+		t.Fatalf("unexpected subscription: %+v", subscription)
+	}
+}
+
+func TestVerifyAppleReceiptRejectsSupersededPlanReplayWithStableConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupSubscriptionAPITestDB(t)
+	userID := "44444444-4444-4444-8444-444444444444"
+	if err := db.Create(&database.User{UserID: userID, Email: "stale-purchase@example.com"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	subscriptionService := service.NewSubscriptionService(db)
+	oldExpiry := time.Now().Add(10 * 24 * time.Hour)
+	newExpiry := time.Now().Add(60 * 24 * time.Hour)
+	oldSubscription, err := subscriptionService.CreateSubscription(
+		userID, "monthly", "Sandbox", "stale-replay-original", oldExpiry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := subscriptionService.CreateSubscription(
+		userID, "yearly", "Sandbox", "stale-replay-original", newExpiry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api := &apiv1.SubscriptionAPI{SubscriptionService: subscriptionService}
+	recorder := postSubscriptionReceipt(t, newSubscriptionVerifyRouter(api), userID,
+		fmt.Sprintf(`{"status":0,"environment":"Sandbox","latest_receipt_info":[{"product_id":"com.guoliang.starmeet.monthly","original_transaction_id":"stale-replay-original","transaction_id":"stale-replay-1","expires_date_ms":"%d"}]}`, oldExpiry.UnixMilli()))
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp response.Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ErrorCode != "stale_purchase" {
+		t.Fatalf("unexpected error code: %+v", resp)
+	}
+
+	var storedOld database.Subscription
+	if err := db.First(&storedOld, oldSubscription.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if storedOld.Status != "replaced" {
+		t.Fatalf("stale replay reactivated old subscription: %+v", storedOld)
+	}
+	active, err := subscriptionService.GetActiveSubscription(userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.ID != upgraded.ID || active.PlanID != "yearly" {
+		t.Fatalf("stale replay replaced active plan: %+v", active)
 	}
 }
 
